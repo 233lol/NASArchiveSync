@@ -37,6 +37,13 @@ type SizedWriter interface {
 	SetSize(size int64)
 }
 
+// RangeReader is implemented by backends that can read an arbitrary byte range
+// of a remote file. It lets the verifier fetch large files over several
+// connections while still hashing every byte in order.
+type RangeReader interface {
+	OpenRange(rel string, offset, length int64) (io.ReadCloser, error)
+}
+
 // Backend abstracts a remote directory tree. All paths are slash separated and
 // relative to the backend root; the empty string refers to the root itself.
 type Backend interface {

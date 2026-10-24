@@ -20,7 +20,7 @@ import (
 
 // version is overridden at build time via
 // -ldflags "-X main.version=x.y.z".
-var version = "0.6.0"
+var version = "0.7.0"
 
 type cliArgs struct {
 	Source         string   `arg:"-s,--source" default:"." help:"源目录，默认为当前目录"`
@@ -37,6 +37,7 @@ type cliArgs struct {
 	KeepSource     bool     `arg:"--keep-source" help:"上传成功后保留本地压缩包"`
 	Force          bool     `arg:"--force" help:"目标已存在且内容不一致时覆盖"`
 	Recheck        bool     `arg:"--recheck" help:"跳过已上传文件时重新读回远端校验 SHA256"`
+	VerifyConc     int      `arg:"--verify-concurrency" default:"4" help:"远端校验的并发读连接数，默认 4；1 表示顺序读取（需要后端支持分片读取，S3 支持）"`
 	CaseSensitive  bool     `arg:"--case-sensitive" help:"包含/排除模式区分大小写（默认不区分）"`
 	SMBUser        string   `arg:"--smb-user,env:NAS_SMB_USER" help:"SMB 用户名，留空表示匿名"`
 	SMBPass        string   `arg:"--smb-pass,env:NAS_SMB_PASS" help:"SMB 密码，建议使用环境变量 NAS_SMB_PASS"`
@@ -207,6 +208,10 @@ func run() int {
 		logger.Errorf("--s3-concurrency 必须在 1-16 之间")
 		return 2
 	}
+	if args.VerifyConc < 1 || args.VerifyConc > 16 {
+		logger.Errorf("--verify-concurrency 必须在 1-16 之间")
+		return 2
+	}
 
 	txtMode, txtErr := app.ParseTxtMode(args.Txt)
 	if txtErr != nil {
@@ -265,21 +270,22 @@ func run() int {
 	defer stop()
 
 	res, err := app.Run(ctx, app.Options{
-		Source:        args.Source,
-		Target:        args.Target,
-		Depth:         args.Depth,
-		WithSourceDir: args.WithSourceDir,
-		List:          args.List,
-		Include:       args.Include,
-		Exclude:       args.Exclude,
-		Extensions:    exts,
-		DryRun:        args.DryRun,
-		KeepSource:    args.KeepSource,
-		Force:         args.Force,
-		Recheck:       args.Recheck,
-		Pipeline:      !args.NoPipeline,
-		NoVerify:      args.NoVerify,
-		CaseSensitive: args.CaseSensitive,
+		Source:            args.Source,
+		Target:            args.Target,
+		Depth:             args.Depth,
+		WithSourceDir:     args.WithSourceDir,
+		List:              args.List,
+		Include:           args.Include,
+		Exclude:           args.Exclude,
+		Extensions:        exts,
+		DryRun:            args.DryRun,
+		KeepSource:        args.KeepSource,
+		Force:             args.Force,
+		Recheck:           args.Recheck,
+		Pipeline:          !args.NoPipeline,
+		NoVerify:          args.NoVerify,
+		VerifyConcurrency: args.VerifyConc,
+		CaseSensitive:     args.CaseSensitive,
 		SMB: app.SMBOptions{
 			User:     args.SMBUser,
 			Password: password,

@@ -2,12 +2,15 @@ package s3
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -71,30 +74,7 @@ func TestPathAndVirtualHostStyles(t *testing.T) {
 			srv := httptest.NewServer(fake)
 			defer srv.Close()
 
-			port := portOf(t, srv.URL)
-			dialer := &net.Dialer{Timeout: 5 * time.Second}
-			hc := &http.Client{Transport: &http.Transport{
-				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-					// Any bucket.example.test host reaches the local test server.
-					return dialer.DialContext(ctx, "tcp", srv.Listener.Addr().String())
-				},
-			}}
-
-			b, err := openWithHTTPClient(storage.Target{
-				Scheme: "s3",
-				Bucket: "oss",
-				Path:   "base",
-			}, storage.Options{
-				S3Endpoint:  "http://example.test:" + port,
-				S3Region:    "garage",
-				S3AccessKey: "access",
-				S3SecretKey: "secret",
-				S3Style:     style,
-				Timeout:     5 * time.Second,
-			}, hc)
-			if err != nil {
-				t.Fatalf("open: %v", err)
-			}
+			b := openTestBackend(t, srv, style, "base")
 
 			w, err := b.Create("dir/a.zip")
 			if err != nil {
@@ -160,6 +140,82 @@ func TestPathAndVirtualHostStyles(t *testing.T) {
 	}
 }
 
+func openTestBackend(t *testing.T, srv *httptest.Server, style, prefix string) storage.Backend {
+	t.Helper()
+	port := portOf(t, srv.URL)
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	hc := &http.Client{Transport: &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			// Any bucket.example.test host reaches the local test server.
+			return dialer.DialContext(ctx, "tcp", srv.Listener.Addr().String())
+		},
+	}}
+	b, err := openWithHTTPClient(storage.Target{
+		Scheme: "s3",
+		Bucket: "oss",
+		Path:   prefix,
+	}, storage.Options{
+		S3Endpoint:  "http://example.test:" + port,
+		S3Region:    "garage",
+		S3AccessKey: "access",
+		S3SecretKey: "secret",
+		S3Style:     style,
+		Timeout:     5 * time.Second,
+	}, hc)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	return b
+}
+
+func TestOpenRange(t *testing.T) {
+	fake := newFakeS3()
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+	b := openTestBackend(t, srv, "path", "base")
+
+	w, err := b.Create("obj.bin")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := io.WriteString(w, "0123456789abcdefghij"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	rr, ok := b.(storage.RangeReader)
+	if !ok {
+		t.Fatal("backend does not implement storage.RangeReader")
+	}
+	rc, err := rr.OpenRange("obj.bin", 5, 4)
+	if err != nil {
+		t.Fatalf("open range: %v", err)
+	}
+	got, err := io.ReadAll(rc)
+	_ = rc.Close()
+	if err != nil || string(got) != "5678" {
+		t.Fatalf("range body = %q, err %v", got, err)
+	}
+
+	// A server that ignores Range would return the whole object; the backend
+	// must reject it instead of hashing those bytes as a small chunk.
+	fake.mu.Lock()
+	fake.ignoreRange = true
+	fake.mu.Unlock()
+	if _, err := rr.OpenRange("obj.bin", 5, 4); err == nil {
+		t.Fatal("expected an error when the server ignores Range")
+	}
+	fake.mu.Lock()
+	fake.ignoreRange = false
+	fake.mu.Unlock()
+
+	if _, err := rr.OpenRange("missing.bin", 0, 4); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("missing object error = %v", err)
+	}
+}
+
 func portOf(t *testing.T, raw string) string {
 	t.Helper()
 	u, err := url.Parse(raw)
@@ -180,9 +236,10 @@ type recorded struct {
 }
 
 type fakeS3 struct {
-	mu   sync.Mutex
-	data map[string][]byte
-	reqs []recorded
+	mu          sync.Mutex
+	data        map[string][]byte
+	reqs        []recorded
+	ignoreRange bool
 }
 
 func newFakeS3() *fakeS3 {
@@ -221,9 +278,22 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == "GET":
 		f.mu.Lock()
 		data, ok := f.data[key]
+		ignoreRange := f.ignoreRange
 		f.mu.Unlock()
 		if !ok {
 			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if rng := r.Header.Get("Range"); rng != "" && !ignoreRange {
+			start, end, ok := parseRange(rng, int64(len(data)))
+			if !ok {
+				w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(data)))
+			w.Header().Set("Content-Length", fmt.Sprint(end-start+1))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(data[start : end+1])
 			return
 		}
 		w.Header().Set("Content-Length", fmt.Sprint(len(data)))
@@ -250,6 +320,29 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.WriteHeader(http.StatusOK)
 	}
+}
+
+// parseRange understands the single "bytes=start-end" form used by OpenRange.
+func parseRange(header string, size int64) (start, end int64, ok bool) {
+	if !strings.HasPrefix(header, "bytes=") {
+		return 0, 0, false
+	}
+	parts := strings.SplitN(strings.TrimPrefix(header, "bytes="), "-", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return 0, 0, false
+	}
+	start, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	end, err = strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	if start < 0 || end < start || end >= size {
+		return 0, 0, false
+	}
+	return start, end, true
 }
 
 func (f *fakeS3) key(r *http.Request) string {

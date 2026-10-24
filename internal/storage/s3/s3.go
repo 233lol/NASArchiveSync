@@ -343,6 +343,40 @@ func (b *Backend) Open(rel string) (io.ReadCloser, error) {
 	return out.Body, nil
 }
 
+// OpenRange reads length bytes starting at offset using an HTTP Range request.
+// The verifier uses it to read large objects over several connections. Servers
+// that ignore the Range header would return the whole object, so the response
+// length is checked to avoid hashing the same bytes twice.
+func (b *Backend) OpenRange(rel string, offset, length int64) (io.ReadCloser, error) {
+	if offset < 0 || length <= 0 {
+		return nil, fmt.Errorf("无效的 S3 读取范围: offset=%d length=%d", offset, length)
+	}
+	key, err := b.resolve(rel)
+	if err != nil {
+		return nil, err
+	}
+	if key == "" {
+		return nil, fmt.Errorf("%w: %s", os.ErrNotExist, b.Root())
+	}
+	out, err := b.client.GetObject(context.Background(), &awss3.GetObjectInput{
+		Bucket: aws.String(b.bucket),
+		Key:    aws.String(key),
+		Range:  aws.String(fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)),
+	})
+	if err != nil {
+		if isNotFound(err) {
+			return nil, fmt.Errorf("%w: %s", os.ErrNotExist, b.Location(rel))
+		}
+		return nil, err
+	}
+	if out.ContentLength != nil && *out.ContentLength != length {
+		_ = out.Body.Close()
+		return nil, fmt.Errorf("S3 服务器未按请求返回字节范围（请求 %d 字节，实际 %d）: %s",
+			length, *out.ContentLength, b.Location(rel))
+	}
+	return out.Body, nil
+}
+
 func (b *Backend) Create(rel string) (storage.Writer, error) {
 	if rel == "" {
 		return nil, errors.New("拒绝写入 bucket 根对象")

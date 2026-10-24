@@ -89,11 +89,14 @@ type Options struct {
 	Pipeline bool
 	// NoVerify disables SHA256 entirely: the archive is uploaded without
 	// hashing and is not read back. Completion notes are marked as unverified.
-	NoVerify      bool
-	CaseSensitive bool
-	SMB           SMBOptions
-	SFTP          SFTPOptions
-	S3            S3Options
+	NoVerify bool
+	// VerifyConcurrency is the number of parallel range reads used when a
+	// backend supports them. Values below 2 read the remote file sequentially.
+	VerifyConcurrency int
+	CaseSensitive     bool
+	SMB               SMBOptions
+	SFTP              SFTPOptions
+	S3                S3Options
 	// SMBMode is "auto" (default), "native" or "builtin". Native means the
 	// operating system's SMB redirector is used and existing Windows
 	// credentials are reused.
@@ -800,7 +803,7 @@ func handleSkip(ctx context.Context, o Options, log *xlog.Logger, backend storag
 		log.Debugf("没有匹配的上传记录，读回远端文件判断是否已上传: %s", st.paths.remotePath)
 		checkCounter := newHash(fc.label("校验已存在", st.file.Rel), st.size)
 		verifyStart := time.Now()
-		remoteSHA, hashErr := hashRemoteFile(ctx, backend, st.paths.remoteRel, checkCounter, st.size)
+		remoteSHA, hashErr := hashRemoteFile(ctx, backend, st.paths.remoteRel, checkCounter, st.size, o.VerifyConcurrency)
 		res.verifyTime += time.Since(verifyStart)
 		if hashErr != nil {
 			checkCounter.Abort()
@@ -832,7 +835,7 @@ func handleSkip(ctx context.Context, o Options, log *xlog.Logger, backend storag
 	} else if o.Recheck {
 		checkCounter := newHash(fc.label("重新校验", st.file.Rel), st.size)
 		verifyStart := time.Now()
-		remoteSHA, hashErr := hashRemoteFile(ctx, backend, st.paths.remoteRel, checkCounter, st.size)
+		remoteSHA, hashErr := hashRemoteFile(ctx, backend, st.paths.remoteRel, checkCounter, st.size, o.VerifyConcurrency)
 		res.verifyTime += time.Since(verifyStart)
 		if hashErr != nil {
 			checkCounter.Abort()
@@ -910,7 +913,7 @@ func verifyUploaded(ctx context.Context, o Options, log *xlog.Logger, backend st
 
 	counter := newHash(fc.label("校验远端", st.file.Rel), st.size)
 	verifyStart := time.Now()
-	remoteSHA, err := hashRemoteFile(ctx, backend, st.paths.remoteRel, counter, st.size)
+	remoteSHA, err := hashRemoteFile(ctx, backend, st.paths.remoteRel, counter, st.size, o.VerifyConcurrency)
 	res.verifyTime = time.Since(verifyStart)
 	if err != nil {
 		counter.Abort()
@@ -1192,7 +1195,10 @@ func hashLocalFile(ctx context.Context, p string, sink progress.Sink, size int64
 	return hashReader(ctx, f, sink, size)
 }
 
-func hashRemoteFile(ctx context.Context, backend storage.Backend, rel string, sink progress.Sink, size int64) (string, error) {
+func hashRemoteFile(ctx context.Context, backend storage.Backend, rel string, sink progress.Sink, size int64, concurrency int) (string, error) {
+	if rr, ok := backend.(storage.RangeReader); ok && concurrency > 1 && size >= parallelHashMinSize {
+		return hashRemoteRanges(ctx, rr, rel, sink, size, concurrency)
+	}
 	f, err := backend.Open(rel)
 	if err != nil {
 		return "", err
