@@ -52,15 +52,25 @@ S3 目标还会把读回拆成多个 Range 请求并发下载，再由主协程�
 
 需要 Go 1.26 或更高版本。
 
+Windows：
+
 ```powershell
 go build -o dist\NASArchiveSync.exe .
+.\build.ps1 -Version 0.7.1
 ```
 
-或使用构建脚本（可注入版本号）：
+Linux / macOS：
 
-```powershell
-.\build.ps1 -Version 0.1.0
+```bash
+go build -o dist/NASArchiveSync .
+./build.sh                      # 生成 dist/NASArchiveSync
+./build.sh --version 0.7.1      # 注入版本号
+./build.sh -o dist/NASArchiveSync-arm64 --goarch arm64
+GOOS=linux GOARCH=arm64 ./build.sh   # 交叉编译
 ```
+
+`build.sh` 默认使用 `CGO_ENABLED=0`，生成不依赖系统库的静态二进制，适合直接复制到 NAS
+或精简 Linux 发行版。如果检出后提示没有执行权限，先运行 `chmod +x build.sh`。
 
 ## 快速开始
 
