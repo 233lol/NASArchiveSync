@@ -61,7 +61,10 @@ type Options struct {
 	Recheck    bool
 	// Pipeline overlaps the upload of the next file with the verification of
 	// the previous one. The CLI enables it by default.
-	Pipeline      bool
+	Pipeline bool
+	// NoVerify disables SHA256 entirely: the archive is uploaded without
+	// hashing and is not read back. Completion notes are marked as unverified.
+	NoVerify      bool
 	CaseSensitive bool
 	SMB           SMBOptions
 	// SMBMode is "auto" (default), "native" or "builtin". Native means the
@@ -143,6 +146,7 @@ type Result struct {
 	HashTime   time.Duration
 	UploadTime time.Duration
 	VerifyTime time.Duration
+	NoVerify   bool
 	DryRun     bool
 	Failures   []string
 }
@@ -157,7 +161,11 @@ func Run(ctx context.Context, o Options) (Result, error) {
 		log = xlog.New(io.Discard, false, false)
 	}
 
-	res := Result{DryRun: o.DryRun}
+	res := Result{DryRun: o.DryRun, NoVerify: o.NoVerify}
+
+	if o.NoVerify && o.Recheck {
+		return res, fmt.Errorf("--recheck 需要读取远端并计算 SHA256，不能与 --no-verify 同时使用")
+	}
 
 	txtMode, err := ParseTxtMode(string(o.Txt))
 	if err != nil {
@@ -280,8 +288,11 @@ func Run(ctx context.Context, o Options) (Result, error) {
 	if o.sourcePrefix != "" {
 		log.Infof("上传目录: %s（--with-source-dir：使用源目录同名文件夹）", uploadBackend.Location(o.sourcePrefix))
 	}
+	if o.NoVerify {
+		log.Warnf("已关闭校验: 不计算 SHA256，上传后不读回远端文件，上传记录将标记为未校验")
+	}
 
-	if !o.DryRun && o.Pipeline {
+	if !o.DryRun && o.Pipeline && !o.NoVerify {
 		verifyBackend, openErr := backends.Open(target, backendOpts, nativeAccess)
 		if openErr != nil {
 			return res, openErr
@@ -561,10 +572,125 @@ func processFile(ctx context.Context, o Options, log *xlog.Logger, backend stora
 		return fileResult{outcome: OutcomePlanned, file: file.Rel, size: st.size}
 	}
 
+	if o.NoVerify {
+		if !o.Force && st.remoteExists {
+			return handleSkipNoVerify(o, log, backend, st)
+		}
+		return uploadAndRecordNoVerify(ctx, o, log, backend, st, fc, newUpload)
+	}
+
 	if !o.Force && st.remoteExists {
 		return handleSkip(ctx, o, log, backend, st, fc, newHash, quiet)
 	}
 	return uploadAndVerify(ctx, o, log, backend, st, fc, newHash, newUpload, quiet)
+}
+
+// recordMatchesFile reports whether a completion note describes this exact
+// source file. Without --no-verify the SHA256 decides; in no-verify mode there
+// is no hash, so size and source modification time (stored to the second) are
+// the only available evidence.
+func recordMatchesFile(rec *report.Record, size int64, mod time.Time) bool {
+	if rec == nil || rec.Size != size {
+		return false
+	}
+	if rec.SourceModTime.IsZero() {
+		return false
+	}
+	return rec.SourceModTime.Equal(mod.Truncate(time.Second))
+}
+
+func handleSkipNoVerify(o Options, log *xlog.Logger, backend storage.Backend, st *fileState) fileResult {
+	res := fileResult{file: st.file.Rel, size: st.size}
+
+	remoteMatch := st.recErr == nil && recordMatchesFile(st.rec, st.size, st.info.ModTime())
+	localMatch := st.localRecErr == nil && recordMatchesFile(st.localRec, st.size, st.info.ModTime())
+
+	var content []byte
+	remoteOK, localOK := false, false
+	switch {
+	case remoteMatch:
+		content, remoteOK, localOK = st.recData, true, localMatch
+	case localMatch:
+		content, localOK = st.localRecData, true
+	}
+	if content == nil {
+		res.outcome = OutcomeFailed
+		res.err = conflictError(st.paths.remotePath, "已关闭校验且没有可用的上传记录，无法确认内容是否一致")
+		return res
+	}
+
+	if err := ensureRecords(o, backend, st.paths.sidecarRel, st.paths.localNote, content, remoteOK, localOK); err != nil {
+		res.outcome = OutcomeFailed
+		res.err = fmt.Errorf("补写上传记录失败，已保留本地源文件: %w", err)
+		return res
+	}
+	log.Successf("远端已存在且记录一致，跳过上传（已关闭校验）: %s", st.paths.remotePath)
+	deleteLocalFile(o, log, st.file.Path, st.size, st.info.ModTime())
+	res.outcome = OutcomeSkipped
+	return res
+}
+
+func uploadAndRecordNoVerify(ctx context.Context, o Options, log *xlog.Logger, backend storage.Backend, st *fileState, fc fileContext, newUpload counterFactory) fileResult {
+	res := fileResult{file: st.file.Rel, size: st.size}
+
+	if st.paths.relDir != "" {
+		if err := backend.MkdirAll(st.paths.relDir); err != nil {
+			res.outcome = OutcomeFailed
+			res.err = fmt.Errorf("创建远端目录失败: %w", err)
+			return res
+		}
+	}
+
+	log.Debugf("上传 %s -> %s（已关闭校验）", st.file.Path, st.paths.remotePath)
+	counter := newUpload(fc.label("上传", st.file.Rel), st.size)
+	uploadStarted := time.Now()
+	_, err := uploadFile(ctx, backend, st.file.Path, st.paths.remoteRel, st.size, o.Force, counter, false)
+	res.uploadTime = time.Since(uploadStarted)
+	if err != nil {
+		counter.Abort()
+		cleanupTempFiles(backend, st.paths.remoteRel, st.paths.sidecarRel)
+		res.outcome = OutcomeFailed
+		res.err = err
+		return res
+	}
+	counter.Finish()
+
+	after, statErr := os.Stat(st.file.Path)
+	if statErr != nil {
+		cleanupRemote(backend, st.paths.remoteRel, st.paths.sidecarRel)
+		res.outcome = OutcomeFailed
+		res.err = fmt.Errorf("上传后检查源文件失败: %w", statErr)
+		return res
+	}
+	if after.Size() != st.size || !after.ModTime().Equal(st.info.ModTime()) {
+		cleanupRemote(backend, st.paths.remoteRel, st.paths.sidecarRel)
+		res.outcome = OutcomeFailed
+		res.err = fmt.Errorf("源文件在上传过程中发生变化，已保留本地文件: %s", st.file.Path)
+		return res
+	}
+
+	record := report.Record{
+		FileName:      filepath.Base(st.file.Path),
+		TargetPath:    st.paths.remotePath,
+		Size:          st.size,
+		UploadedAt:    now(o),
+		SourcePath:    st.file.Path,
+		SourceModTime: st.info.ModTime(),
+		Duration:      res.uploadTime,
+		ToolVersion:   version(o),
+		NoVerify:      true,
+	}
+	content := []byte(record.Render())
+	if err := ensureRecords(o, backend, st.paths.sidecarRel, st.paths.localNote, content, false, false); err != nil {
+		res.outcome = OutcomeFailed
+		res.err = fmt.Errorf("远端文件已上传，但保存上传记录失败，已保留本地源文件: %w", err)
+		return res
+	}
+
+	log.Successf("上传完成（已关闭校验，未读回远端）: %s", st.paths.remotePath)
+	deleteLocalFile(o, log, st.file.Path, st.size, st.info.ModTime())
+	res.outcome = OutcomeUploaded
+	return res
 }
 
 func handleSkip(ctx context.Context, o Options, log *xlog.Logger, backend storage.Backend, st *fileState, fc fileContext, newHash counterFactory, quiet bool) fileResult {
@@ -685,7 +811,7 @@ func uploadOnly(ctx context.Context, o Options, log *xlog.Logger, backend storag
 	log.Debugf("上传 %s -> %s", st.file.Path, st.paths.remotePath)
 	counter := newUpload(fc.label("上传", st.file.Rel), st.size)
 	uploadStarted := time.Now()
-	localSHA, err := uploadFile(ctx, backend, st.file.Path, st.paths.remoteRel, st.size, o.Force, counter)
+	localSHA, err := uploadFile(ctx, backend, st.file.Path, st.paths.remoteRel, st.size, o.Force, counter, true)
 	uploadDuration := time.Since(uploadStarted)
 	if err != nil {
 		counter.Abort()
@@ -812,7 +938,7 @@ func planFile(o Options, log *xlog.Logger, backend storage.Backend, file scan.Fi
 	return nil
 }
 
-func uploadFile(ctx context.Context, backend storage.Backend, localPath, remoteRel string, size int64, overwrite bool, sink progress.Sink) (string, error) {
+func uploadFile(ctx context.Context, backend storage.Backend, localPath, remoteRel string, size int64, overwrite bool, sink progress.Sink, computeHash bool) (string, error) {
 	src, err := os.Open(localPath)
 	if err != nil {
 		return "", fmt.Errorf("打开源文件失败: %w", err)
@@ -828,10 +954,13 @@ func uploadFile(ctx context.Context, backend storage.Backend, localPath, remoteR
 	}
 
 	// Hash the bytes while they are copied, so the local file only has to be
-	// read once for a new upload.
+	// read once for a new upload. --no-verify skips hashing entirely.
 	h := sha256.New()
-	reader := progress.NewReader(ctxReader{ctx: ctx, r: src}, sink)
-	written, copyErr := io.CopyBuffer(dst, io.TeeReader(reader, h), make([]byte, bufferSizeFor(size)))
+	reader := io.Reader(progress.NewReader(ctxReader{ctx: ctx, r: src}, sink))
+	if computeHash {
+		reader = io.TeeReader(reader, h)
+	}
+	written, copyErr := io.CopyBuffer(dst, reader, make([]byte, bufferSizeFor(size)))
 	if copyErr == nil && written != size {
 		copyErr = fmt.Errorf("写入字节数不符: 已写入 %d，期望 %d", written, size)
 	}
@@ -852,6 +981,9 @@ func uploadFile(ctx context.Context, backend storage.Backend, localPath, remoteR
 	if err := backend.Rename(tmpRel, remoteRel); err != nil {
 		_ = backend.Remove(tmpRel)
 		return "", fmt.Errorf("重命名远端临时文件失败: %w", err)
+	}
+	if !computeHash {
+		return "", nil
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
@@ -1151,10 +1283,19 @@ func PrintResult(w io.Writer, r Result) {
 		fmt.Fprintf(w, "跳过       : %d\n", r.Skipped)
 	}
 	fmt.Fprintf(w, "失败       : %d\n", r.Failed)
-	if !r.DryRun && (r.HashTime > 0 || r.UploadTime > 0 || r.VerifyTime > 0) {
-		fmt.Fprintf(w, "本地哈希   : %s\n", humanize.Duration(r.HashTime))
-		fmt.Fprintf(w, "上传累计   : %s\n", humanize.Duration(r.UploadTime))
-		fmt.Fprintf(w, "校验累计   : %s\n", humanize.Duration(r.VerifyTime))
+	if r.NoVerify {
+		fmt.Fprintln(w, "校验       : 已关闭（不计算 SHA256，不读回远端）")
+	}
+	if !r.DryRun {
+		if r.HashTime > 0 {
+			fmt.Fprintf(w, "本地哈希   : %s\n", humanize.Duration(r.HashTime))
+		}
+		if r.UploadTime > 0 {
+			fmt.Fprintf(w, "上传累计   : %s\n", humanize.Duration(r.UploadTime))
+		}
+		if r.VerifyTime > 0 {
+			fmt.Fprintf(w, "校验累计   : %s\n", humanize.Duration(r.VerifyTime))
+		}
 	}
 	fmt.Fprintf(w, "总耗时     : %s\n", humanize.Duration(r.Duration))
 	if len(r.Failures) > 0 {

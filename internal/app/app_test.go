@@ -806,6 +806,140 @@ func TestRunPipelineSkipsAlreadyUploaded(t *testing.T) {
 	}
 }
 
+func TestRunNoVerifyUploadsWithoutHashing(t *testing.T) {
+	src := t.TempDir()
+	dst := filepath.Join(t.TempDir(), "target")
+	writeSourceFile(t, src, "a/one.zip", "one")
+	writeSourceFile(t, src, "two.7z", "two")
+
+	opts := testOptions(src, dst)
+	opts.NoVerify = true
+	opts.Pipeline = true // pipeline is ignored when verification is off
+
+	res, err := Run(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Uploaded != 2 || res.Failed != 0 || !res.NoVerify {
+		t.Fatalf("result: %+v", res)
+	}
+	if res.HashTime != 0 || res.VerifyTime != 0 {
+		t.Errorf("no hashing expected: hash=%v verify=%v", res.HashTime, res.VerifyTime)
+	}
+
+	rec, err := report.Parse([]byte(readFile(t, filepath.Join(dst, "a", "one.zip.txt"))))
+	if err != nil {
+		t.Fatalf("parse sidecar: %v", err)
+	}
+	if !rec.NoVerify || rec.SHA256 != "" || rec.Verified {
+		t.Errorf("unexpected no-verify record: %+v", rec)
+	}
+	if rec.Size != int64(len("one")) {
+		t.Errorf("size = %d", rec.Size)
+	}
+	if exists(filepath.Join(src, "a", "one.zip")) || exists(filepath.Join(src, "two.7z")) {
+		t.Error("sources should be deleted after a successful no-verify upload")
+	}
+	if !exists(filepath.Join(src, "a", "one.zip.txt")) {
+		t.Error("local completion note missing")
+	}
+}
+
+func TestRunNoVerifySkipsMatchingRecord(t *testing.T) {
+	src := t.TempDir()
+	dst := filepath.Join(t.TempDir(), "target")
+	writeSourceFile(t, src, "one.zip", "one")
+	writeSourceFile(t, src, "two.zip", "two")
+
+	opts := testOptions(src, dst)
+	opts.NoVerify = true
+	opts.KeepSource = true
+	if res, err := Run(context.Background(), opts); err != nil || res.Uploaded != 2 {
+		t.Fatalf("first run: res=%+v err=%v", res, err)
+	}
+
+	res, err := Run(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+	if res.Skipped != 2 || res.Uploaded != 0 || res.Failed != 0 {
+		t.Fatalf("second run result: %+v", res)
+	}
+
+	// Same size but a different file (and a different modification time) must
+	// not be treated as already uploaded.
+	p := filepath.Join(src, "one.zip")
+	if err := os.WriteFile(p, []byte("ONE"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	newMod := time.Now().Add(2 * time.Hour).Truncate(time.Second)
+	if err := os.Chtimes(p, newMod, newMod); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err = Run(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("third run: %v", err)
+	}
+	if res.Skipped != 1 || res.Failed != 1 || res.Uploaded != 0 {
+		t.Fatalf("third run result: %+v", res)
+	}
+	if !exists(p) {
+		t.Error("conflicting source must be kept")
+	}
+	if got := readFile(t, filepath.Join(dst, "one.zip")); got != "one" {
+		t.Errorf("remote one.zip = %q, want untouched old content", got)
+	}
+}
+
+func TestRunNoVerifyConflictNeedsForce(t *testing.T) {
+	src := t.TempDir()
+	dst := filepath.Join(t.TempDir(), "target")
+	writeSourceFile(t, src, "a.zip", "local")
+	writeSourceFile(t, dst, "a.zip", "remote")
+
+	opts := testOptions(src, dst)
+	opts.NoVerify = true
+
+	res, err := Run(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Failed != 1 || res.Uploaded != 0 {
+		t.Fatalf("result: %+v", res)
+	}
+	if !exists(filepath.Join(src, "a.zip")) {
+		t.Error("conflicting source must be kept")
+	}
+	if got := readFile(t, filepath.Join(dst, "a.zip")); got != "remote" {
+		t.Errorf("remote file changed without --force: %q", got)
+	}
+
+	opts.Force = true
+	res, err = Run(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("force run: %v", err)
+	}
+	if res.Uploaded != 1 || res.Failed != 0 {
+		t.Fatalf("force result: %+v", res)
+	}
+	if got := readFile(t, filepath.Join(dst, "a.zip")); got != "local" {
+		t.Errorf("remote file = %q, want local content", got)
+	}
+	if exists(filepath.Join(src, "a.zip")) {
+		t.Error("source should be deleted after a successful forced upload")
+	}
+}
+
+func TestRunNoVerifyRejectsRecheck(t *testing.T) {
+	opts := testOptions(t.TempDir(), filepath.Join(t.TempDir(), "target"))
+	opts.NoVerify = true
+	opts.Recheck = true
+	if _, err := Run(context.Background(), opts); err == nil {
+		t.Fatal("expected --no-verify and --recheck to be rejected")
+	}
+}
+
 func TestRunHandlesEmptyArchive(t *testing.T) {
 	src := t.TempDir()
 	dst := filepath.Join(t.TempDir(), "target")

@@ -18,6 +18,7 @@ const (
 	KeyTargetPath   = "上传路径"
 	KeySize         = "文件大小(字节)"
 	KeySHA256       = "SHA256"
+	KeyVerifyMode   = "校验方式"
 	KeyUploadedAt   = "上传时间"
 	KeyVerified     = "校验结果"
 	KeySourcePath   = "源路径"
@@ -26,6 +27,10 @@ const (
 	KeyToolVersion  = "工具版本"
 	timeLayout      = "2006-01-02 15:04:05 -07:00"
 	verifiedMessage = "本地与远端 SHA256 一致"
+	// VerifyModeNone marks a note written with --no-verify. Such a note has no
+	// SHA256 and must not be treated as a verified upload.
+	VerifyModeNone = "none"
+	shaNotComputed = "未计算"
 )
 
 // Record is the content of a completion note.
@@ -40,6 +45,9 @@ type Record struct {
 	Duration      time.Duration
 	ToolVersion   string
 	Verified      bool
+	// NoVerify is true when the archive was uploaded with --no-verify: no
+	// SHA256 was computed and the remote file was not read back.
+	NoVerify bool
 }
 
 // SidecarName returns the completion note file name for an archive, e.g.
@@ -56,9 +64,14 @@ func (r Record) Render() string {
 	writeLine(&b, KeyFileName, r.FileName)
 	writeLine(&b, KeyTargetPath, r.TargetPath)
 	writeLine(&b, KeySize, strconv.FormatInt(r.Size, 10))
-	writeLine(&b, KeySHA256, r.SHA256)
+	if r.NoVerify {
+		writeLine(&b, KeyVerifyMode, VerifyModeNone)
+		writeLine(&b, KeySHA256, shaNotComputed)
+	} else {
+		writeLine(&b, KeySHA256, r.SHA256)
+	}
 	writeLine(&b, KeyUploadedAt, r.UploadedAt.Format(timeLayout))
-	writeLine(&b, KeyVerified, verifiedText(r.Verified))
+	writeLine(&b, KeyVerified, verifiedText(r))
 	writeLine(&b, KeySourcePath, r.SourcePath)
 	writeLine(&b, KeySourceMTime, r.SourceModTime.Format(timeLayout))
 	writeLine(&b, KeyDuration, humanize.Duration(r.Duration))
@@ -66,8 +79,11 @@ func (r Record) Render() string {
 	return b.String()
 }
 
-func verifiedText(ok bool) string {
-	if ok {
+func verifiedText(r Record) string {
+	if r.NoVerify {
+		return "未校验（已关闭校验）"
+	}
+	if r.Verified {
 		return verifiedMessage
 	}
 	return "未校验"
@@ -85,6 +101,7 @@ func writeLine(b *strings.Builder, key, value string) {
 func Parse(data []byte) (*Record, error) {
 	rec := &Record{Size: -1}
 	seenSHA := false
+	verifyMode := "sha256"
 
 	for i, raw := range strings.Split(string(data), "\n") {
 		line := strings.TrimSpace(raw)
@@ -111,8 +128,19 @@ func Parse(data []byte) (*Record, error) {
 				return nil, fmt.Errorf("上传记录中的文件大小无效: %q", value)
 			}
 			rec.Size = n
+		case KeyVerifyMode:
+			switch strings.ToLower(value) {
+			case "sha256", VerifyModeNone:
+				verifyMode = strings.ToLower(value)
+			default:
+				return nil, fmt.Errorf("上传记录中的校验方式无效: %q", value)
+			}
 		case KeySHA256:
 			sum := strings.ToLower(value)
+			if sum == "" || sum == shaNotComputed {
+				// Allowed for --no-verify notes; validated below.
+				continue
+			}
 			if len(sum) != 64 {
 				return nil, fmt.Errorf("上传记录中的 SHA256 长度无效")
 			}
@@ -138,7 +166,9 @@ func Parse(data []byte) (*Record, error) {
 		}
 	}
 
-	if !seenSHA {
+	if verifyMode == VerifyModeNone {
+		rec.NoVerify = true
+	} else if !seenSHA {
 		return nil, fmt.Errorf("上传记录缺少 SHA256 字段")
 	}
 	if rec.FileName == "" && rec.TargetPath != "" {

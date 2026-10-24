@@ -18,7 +18,7 @@ import (
 
 // version is overridden at build time via
 // -ldflags "-X main.version=x.y.z".
-var version = "0.2.0"
+var version = "0.3.0"
 
 type cliArgs struct {
 	Source        string   `arg:"-s,--source" default:"." help:"源目录，默认为当前目录"`
@@ -31,6 +31,7 @@ type cliArgs struct {
 	Exts          []string `arg:"--ext,separate" help:"归档扩展名，默认 zip,7z,rar，可重复使用"`
 	DryRun        bool     `arg:"--dry-run" help:"演练模式：只打印计划，不上传、不写记录、不删除"`
 	NoPipeline    bool     `arg:"--no-pipeline" help:"关闭上传/校验流水线，改为逐文件顺序处理（默认开启流水线）"`
+	NoVerify      bool     `arg:"--no-verify" help:"关闭校验：不计算 SHA256，上传后不读回远端文件，记录标记为未校验"`
 	KeepSource    bool     `arg:"--keep-source" help:"上传成功后保留本地压缩包"`
 	Force         bool     `arg:"--force" help:"目标已存在且内容不一致时覆盖"`
 	Recheck       bool     `arg:"--recheck" help:"跳过已上传文件时重新读回远端校验 SHA256"`
@@ -91,6 +92,9 @@ func (cliArgs) Epilogue() string {
   # 关闭流水线，改为逐文件上传后再校验
   NASArchiveSync -s "C:\game" -t "\\192.168.12.1\mnt\hdd1\game" --depth 1 --no-pipeline
 
+  # 关闭校验：不计算 SHA256、不读回远端，记录标记为未校验
+  NASArchiveSync -s "C:\game" -t "\\192.168.12.1\mnt\hdd1\game" --depth 1 --no-verify
+
 匹配模式:
   * 匹配任意字符，? 匹配单个字符，** 匹配多级目录，{a,b} 匹配多选一。
   不含 / 的模式匹配任意层级的目录名或文件名，例如 --exclude temp。
@@ -118,6 +122,10 @@ func run() int {
 	}
 	if args.SMBPort <= 0 || args.SMBPort > 65535 {
 		logger.Errorf("--smb-port 必须在 1-65535 之间")
+		return 2
+	}
+	if args.NoVerify && args.Recheck {
+		logger.Errorf("--recheck 需要读取远端并计算 SHA256，不能与 --no-verify 同时使用")
 		return 2
 	}
 
@@ -173,6 +181,7 @@ func run() int {
 		Force:         args.Force,
 		Recheck:       args.Recheck,
 		Pipeline:      !args.NoPipeline,
+		NoVerify:      args.NoVerify,
 		CaseSensitive: args.CaseSensitive,
 		SMB: app.SMBOptions{
 			User:     args.SMBUser,

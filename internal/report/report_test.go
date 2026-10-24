@@ -44,6 +44,35 @@ func TestRenderParseRoundTrip(t *testing.T) {
 	}
 }
 
+func TestRenderParseNoVerify(t *testing.T) {
+	in := sampleRecord()
+	in.NoVerify = true
+	in.SHA256 = ""
+	in.Verified = false
+
+	rendered := in.Render()
+	if !strings.Contains(rendered, "校验方式: none") {
+		t.Errorf("no-verify note should declare its mode:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, "SHA256: 未计算") {
+		t.Errorf("no-verify note should state that SHA256 was not computed:\n%s", rendered)
+	}
+
+	out, err := Parse([]byte(rendered))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if !out.NoVerify {
+		t.Error("NoVerify flag lost")
+	}
+	if out.SHA256 != "" {
+		t.Errorf("SHA256 = %q, want empty", out.SHA256)
+	}
+	if out.Verified {
+		t.Error("no-verify note must not be reported as verified")
+	}
+}
+
 func TestParseRejectsMissingSHA(t *testing.T) {
 	_, err := Parse([]byte("原始文件名: z.7z\n文件大小(字节): 1\n"))
 	if err == nil {
