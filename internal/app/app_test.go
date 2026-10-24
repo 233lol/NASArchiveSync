@@ -940,6 +940,35 @@ func TestRunNoVerifyRejectsRecheck(t *testing.T) {
 	}
 }
 
+func TestRunPlainLocalTarget(t *testing.T) {
+	src := t.TempDir()
+	dst := filepath.Join(t.TempDir(), "backup")
+	writeSourceFile(t, src, "a.zip", "archive-a")
+
+	opts := testOptions(src, dst)
+	// A plain Windows/local path (no local: prefix) must be accepted as a
+	// local folder target.
+	opts.Target = dst
+	opts.KeepSource = true
+
+	res, err := Run(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Uploaded != 1 || res.Failed != 0 {
+		t.Fatalf("result: %+v", res)
+	}
+	if got := readFile(t, filepath.Join(dst, "a.zip")); got != "archive-a" {
+		t.Errorf("copied content = %q", got)
+	}
+	if !exists(filepath.Join(dst, "a.zip.txt")) {
+		t.Error("target-side record missing")
+	}
+	if !exists(filepath.Join(src, "a.zip")) {
+		t.Error("--keep-source should keep the source")
+	}
+}
+
 func TestRunHandlesEmptyArchive(t *testing.T) {
 	src := t.TempDir()
 	dst := filepath.Join(t.TempDir(), "target")

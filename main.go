@@ -20,11 +20,11 @@ import (
 
 // version is overridden at build time via
 // -ldflags "-X main.version=x.y.z".
-var version = "0.4.0"
+var version = "0.4.1"
 
 type cliArgs struct {
 	Source        string   `arg:"-s,--source" default:"." help:"源目录，默认为当前目录"`
-	Target        string   `arg:"-t,--target" help:"目标目录，如 \\\\192.168.12.1\\mnt\\hdd1\\game 或 smb://192.168.12.1/mnt/hdd1/game（--list 时可省略）"`
+	Target        string   `arg:"-t,--target" help:"目标目录：\\\\host\\share\\dir、smb://host/share/dir、sftp://user@host/dir、user@host:/dir，或本地文件夹 C:\\backup（--list 时可省略）"`
 	Depth         int      `arg:"--depth" default:"0" help:"最大目录层数：0 仅源目录本身（默认），-1 不限，1 含一级子目录"`
 	WithSourceDir bool     `arg:"--with-source-dir" help:"在目标目录下创建与源目录同名的文件夹后再上传，如 源 C:\\game\\a → 目标\\game\\a"`
 	List          bool     `arg:"-l,--list" help:"只列出匹配到的归档文件，不上传、不写记录、不删除（可省略 --target）"`
@@ -59,7 +59,7 @@ type cliArgs struct {
 }
 
 func (cliArgs) Description() string {
-	return "NASArchiveSync - 把 zip/7z/rar 归档通过 SMB 或 SFTP 上传到 NAS，SHA256 双向校验后在 NAS 和本地各写一份记录，再删除本地压缩包。"
+	return "NASArchiveSync - 把 zip/7z/rar 归档通过 SMB、SFTP 或本地文件夹复制/上传，SHA256 双向校验后在目标和本地各写一份记录，再删除本地压缩包。"
 }
 
 func (cliArgs) Version() string {
@@ -105,6 +105,12 @@ func (cliArgs) Epilogue() string {
 
   # 关闭校验：不计算 SHA256、不读回远端，记录标记为未校验
   NASArchiveSync -s "C:\game" -t "\\192.168.12.1\mnt\hdd1\game" --depth 1 --no-verify
+
+  # 复制到本地文件夹（同样做 SHA256 校验、写记录、删源）
+  NASArchiveSync -s "C:\game" -t "D:\backup\game" --depth 1
+
+  # 本地文件夹也支持 file:// 和 local: 写法
+  NASArchiveSync -s "C:\game" -t "file:///D:/backup/game" --depth 1
 
   # 通过 SFTP 上传（默认使用 ~/.ssh 下的私钥，known_hosts 校验主机）
   NASArchiveSync -s "C:\game" -t "sftp://user@192.168.12.1/mnt/hdd1/game" --depth 1

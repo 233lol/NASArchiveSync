@@ -109,6 +109,7 @@ func (t Target) UNCPath() string {
 //	192.168.12.1:/mnt/hdd1/game       scp style absolute path (SFTP)
 //	local:C:\game                     local directory (mainly for testing)
 //	local:///mnt/game                 local directory with URL syntax
+//	file:///C:/backup                 local directory with file URL syntax
 //	C:\game                           plain local path
 func ParseTarget(raw string) (Target, error) {
 	s := strings.TrimSpace(raw)
@@ -188,6 +189,26 @@ func ParseTarget(raw string) (Target, error) {
 		t.Path = cleanRemotePath(u.Path)
 		return t, nil
 
+	case strings.HasPrefix(lower, "file://"):
+		u, err := url.Parse(s)
+		if err != nil {
+			return Target{}, fmt.Errorf("解析本地文件地址失败: %w", err)
+		}
+		if u.Host != "" && !strings.EqualFold(u.Host, "localhost") {
+			return Target{}, fmt.Errorf("file:// 远程主机请改用 UNC 或 smb:// 形式: %s", raw)
+		}
+		p := u.Path
+		// file:///C:/backup leaves a leading slash in front of the drive letter.
+		if len(p) >= 3 && p[0] == '/' && isDriveLetter(p[1]) && p[2] == ':' {
+			p = p[1:]
+		}
+		if strings.TrimSpace(p) == "" {
+			return Target{}, fmt.Errorf("本地目标路径不能为空: %s", raw)
+		}
+		t.Scheme = "local"
+		t.Path = p
+		return t, nil
+
 	case strings.HasPrefix(lower, "local:"):
 		p := s[len("local:"):]
 		p = strings.TrimPrefix(p, "//")
@@ -217,6 +238,8 @@ func ParseTarget(raw string) (Target, error) {
 			return Target{}, fmt.Errorf("SFTP 地址格式无效，请使用 sftp://host/path、scp://host/path 或 host:/path: %s", raw)
 		case "smb":
 			return Target{}, fmt.Errorf("SMB 地址格式无效，请使用 smb://host/share/path 或 \\\\host\\share\\path: %s", raw)
+		case "file":
+			return Target{}, fmt.Errorf("本地文件地址格式无效，请使用 file:///C:/path 或直接写 C:\\path: %s", raw)
 		}
 		return Target{}, fmt.Errorf("暂不支持协议 %q，目前支持 smb、sftp 与 local", scheme)
 	}
