@@ -20,46 +20,53 @@ import (
 
 // version is overridden at build time via
 // -ldflags "-X main.version=x.y.z".
-var version = "0.4.1"
+var version = "0.5.0"
 
 type cliArgs struct {
-	Source        string   `arg:"-s,--source" default:"." help:"源目录，默认为当前目录"`
-	Target        string   `arg:"-t,--target" help:"目标目录：\\\\host\\share\\dir、smb://host/share/dir、sftp://user@host/dir、user@host:/dir，或本地文件夹 C:\\backup（--list 时可省略）"`
-	Depth         int      `arg:"--depth" default:"0" help:"最大目录层数：0 仅源目录本身（默认），-1 不限，1 含一级子目录"`
-	WithSourceDir bool     `arg:"--with-source-dir" help:"在目标目录下创建与源目录同名的文件夹后再上传，如 源 C:\\game\\a → 目标\\game\\a"`
-	List          bool     `arg:"-l,--list" help:"只列出匹配到的归档文件，不上传、不写记录、不删除（可省略 --target）"`
-	Include       []string `arg:"-i,--include,separate" help:"只处理匹配的目录/文件，可重复使用"`
-	Exclude       []string `arg:"-e,--exclude,separate" help:"排除匹配的目录/文件，可重复使用"`
-	Exts          []string `arg:"--ext,separate" help:"归档扩展名，默认 zip,7z,rar，可重复使用"`
-	DryRun        bool     `arg:"--dry-run" help:"演练模式：只打印计划，不上传、不写记录、不删除"`
-	NoPipeline    bool     `arg:"--no-pipeline" help:"关闭上传/校验流水线，改为逐文件顺序处理（默认开启流水线）"`
-	NoVerify      bool     `arg:"--no-verify" help:"关闭校验：不计算 SHA256，上传后不读回远端文件，记录标记为未校验"`
-	KeepSource    bool     `arg:"--keep-source" help:"上传成功后保留本地压缩包"`
-	Force         bool     `arg:"--force" help:"目标已存在且内容不一致时覆盖"`
-	Recheck       bool     `arg:"--recheck" help:"跳过已上传文件时重新读回远端校验 SHA256"`
-	CaseSensitive bool     `arg:"--case-sensitive" help:"包含/排除模式区分大小写（默认不区分）"`
-	SMBUser       string   `arg:"--smb-user" env:"NAS_SMB_USER" help:"SMB 用户名，留空表示匿名"`
-	SMBPass       string   `arg:"--smb-pass" env:"NAS_SMB_PASS" help:"SMB 密码，建议使用环境变量 NAS_SMB_PASS"`
-	SMBAskPass    bool     `arg:"--smb-ask-pass" help:"交互式输入 SMB 密码（不回显）"`
-	SMBDomain     string   `arg:"--smb-domain" env:"NAS_SMB_DOMAIN" help:"SMB 域/工作组"`
-	SMBPort       int      `arg:"--smb-port" default:"445" help:"SMB 端口，默认 445（内置客户端使用）"`
-	SMBMode       string   `arg:"--smb-mode" default:"auto" help:"SMB 访问方式：auto 无凭据时复用系统访问；native 系统 UNC/映射盘；builtin 内置 SMB 客户端"`
-	SFTPUser      string   `arg:"--sftp-user" env:"NAS_SFTP_USER" help:"SFTP 用户名，默认使用当前系统用户"`
-	SFTPPass      string   `arg:"--sftp-pass" env:"NAS_SFTP_PASS" help:"SFTP 密码，建议使用环境变量 NAS_SFTP_PASS"`
-	SFTPAskPass   bool     `arg:"--sftp-ask-pass" help:"交互式输入 SFTP 密码（不回显）"`
-	SFTPKey       string   `arg:"--sftp-key" env:"NAS_SFTP_KEY" help:"SFTP 私钥路径，默认自动尝试 ~/.ssh/id_ed25519、id_ecdsa、id_rsa"`
-	SFTPKeyPass   string   `arg:"--sftp-key-pass" env:"NAS_SFTP_KEY_PASS" help:"SFTP 私钥口令"`
-	SFTPPort      int      `arg:"--sftp-port" default:"22" help:"SFTP 端口，默认 22"`
-	SFTPCipher    string   `arg:"--sftp-cipher" default:"auto" help:"SFTP 加密算法：auto（默认，自动选择最快）、aes128-gcm@openssh.com、aes256-gcm@openssh.com、chacha20-poly1305@openssh.com、aes128-ctr、aes192-ctr、aes256-ctr"`
-	SFTPKnown     string   `arg:"--sftp-known-hosts" help:"known_hosts 路径，默认 ~/.ssh/known_hosts"`
-	SFTPInsecure  bool     `arg:"--sftp-insecure" help:"跳过 SFTP 主机密钥校验（不安全，仅建议测试环境使用）"`
-	Txt           string   `arg:"--txt" default:"both" help:"上传记录保存位置：both 双方（默认）、local 仅本地、remote 仅远程、none 不生成"`
-	NoProgress    bool     `arg:"--no-progress" help:"关闭进度条"`
-	Verbose       bool     `arg:"-v,--verbose" help:"输出调试日志"`
+	Source         string   `arg:"-s,--source" default:"." help:"源目录，默认为当前目录"`
+	Target         string   `arg:"-t,--target" help:"目标：\\\\host\\share\\dir、smb://host/share/dir、sftp://user@host/dir、s3://bucket/prefix，或本地文件夹 C:\\backup（--list 时可省略）"`
+	Depth          int      `arg:"--depth" default:"0" help:"最大目录层数：0 仅源目录本身（默认），-1 不限，1 含一级子目录"`
+	WithSourceDir  bool     `arg:"--with-source-dir" help:"在目标目录下创建与源目录同名的文件夹后再上传，如 源 C:\\game\\a → 目标\\game\\a"`
+	List           bool     `arg:"-l,--list" help:"只列出匹配到的归档文件，不上传、不写记录、不删除（可省略 --target）"`
+	Include        []string `arg:"-i,--include,separate" help:"只处理匹配的目录/文件，可重复使用"`
+	Exclude        []string `arg:"-e,--exclude,separate" help:"排除匹配的目录/文件，可重复使用"`
+	Exts           []string `arg:"--ext,separate" help:"归档扩展名，默认 zip,7z,rar，可重复使用"`
+	DryRun         bool     `arg:"--dry-run" help:"演练模式：只打印计划，不上传、不写记录、不删除"`
+	NoPipeline     bool     `arg:"--no-pipeline" help:"关闭上传/校验流水线，改为逐文件顺序处理（默认开启流水线）"`
+	NoVerify       bool     `arg:"--no-verify" help:"关闭校验：不计算 SHA256，上传后不读回远端文件，记录标记为未校验"`
+	KeepSource     bool     `arg:"--keep-source" help:"上传成功后保留本地压缩包"`
+	Force          bool     `arg:"--force" help:"目标已存在且内容不一致时覆盖"`
+	Recheck        bool     `arg:"--recheck" help:"跳过已上传文件时重新读回远端校验 SHA256"`
+	CaseSensitive  bool     `arg:"--case-sensitive" help:"包含/排除模式区分大小写（默认不区分）"`
+	SMBUser        string   `arg:"--smb-user,env:NAS_SMB_USER" help:"SMB 用户名，留空表示匿名"`
+	SMBPass        string   `arg:"--smb-pass,env:NAS_SMB_PASS" help:"SMB 密码，建议使用环境变量 NAS_SMB_PASS"`
+	SMBAskPass     bool     `arg:"--smb-ask-pass" help:"交互式输入 SMB 密码（不回显）"`
+	SMBDomain      string   `arg:"--smb-domain,env:NAS_SMB_DOMAIN" help:"SMB 域/工作组"`
+	SMBPort        int      `arg:"--smb-port" default:"445" help:"SMB 端口，默认 445（内置客户端使用）"`
+	SMBMode        string   `arg:"--smb-mode" default:"auto" help:"SMB 访问方式：auto 无凭据时复用系统访问；native 系统 UNC/映射盘；builtin 内置 SMB 客户端"`
+	SFTPUser       string   `arg:"--sftp-user,env:NAS_SFTP_USER" help:"SFTP 用户名，默认使用当前系统用户"`
+	SFTPPass       string   `arg:"--sftp-pass,env:NAS_SFTP_PASS" help:"SFTP 密码，建议使用环境变量 NAS_SFTP_PASS"`
+	SFTPAskPass    bool     `arg:"--sftp-ask-pass" help:"交互式输入 SFTP 密码（不回显）"`
+	SFTPKey        string   `arg:"--sftp-key,env:NAS_SFTP_KEY" help:"SFTP 私钥路径，默认自动尝试 ~/.ssh/id_ed25519、id_ecdsa、id_rsa"`
+	SFTPKeyPass    string   `arg:"--sftp-key-pass,env:NAS_SFTP_KEY_PASS" help:"SFTP 私钥口令"`
+	SFTPPort       int      `arg:"--sftp-port" default:"22" help:"SFTP 端口，默认 22"`
+	SFTPCipher     string   `arg:"--sftp-cipher" default:"auto" help:"SFTP 加密算法：auto（默认，自动选择最快）、aes128-gcm@openssh.com、aes256-gcm@openssh.com、chacha20-poly1305@openssh.com、aes128-ctr、aes192-ctr、aes256-ctr"`
+	SFTPKnown      string   `arg:"--sftp-known-hosts" help:"known_hosts 路径，默认 ~/.ssh/known_hosts"`
+	SFTPInsecure   bool     `arg:"--sftp-insecure" help:"跳过 SFTP 主机密钥校验（不安全，仅建议测试环境使用）"`
+	S3Endpoint     string   `arg:"--s3-endpoint,env:NAS_S3_ENDPOINT" help:"S3 endpoint，如 http://192.168.1.5:3900；留空使用 AWS 默认端点"`
+	S3Region       string   `arg:"--s3-region,env:NAS_S3_REGION" default:"us-east-1" help:"S3 区域，Garage 常用 garage"`
+	S3AccessKey    string   `arg:"--s3-access-key,env:NAS_S3_ACCESS_KEY" help:"S3 Access Key ID"`
+	S3SecretKey    string   `arg:"--s3-secret-key,env:NAS_S3_SECRET_KEY" help:"S3 Secret Access Key，建议使用环境变量 NAS_S3_SECRET_KEY"`
+	S3SessionToken string   `arg:"--s3-session-token,env:NAS_S3_SESSION_TOKEN" help:"S3 临时会话令牌（可选）"`
+	S3Style        string   `arg:"--s3-style" default:"auto" help:"S3 访问方式：auto 自动、path 路径模式、virtual 虚拟主机模式"`
+	S3Insecure     bool     `arg:"--s3-insecure" help:"跳过 S3 HTTPS 证书校验（不安全，仅测试环境使用）"`
+	Txt            string   `arg:"--txt" default:"both" help:"上传记录保存位置：both 双方（默认）、local 仅本地、remote 仅远程、none 不生成"`
+	NoProgress     bool     `arg:"--no-progress" help:"关闭进度条"`
+	Verbose        bool     `arg:"-v,--verbose" help:"输出调试日志"`
 }
 
 func (cliArgs) Description() string {
-	return "NASArchiveSync - 把 zip/7z/rar 归档通过 SMB、SFTP 或本地文件夹复制/上传，SHA256 双向校验后在目标和本地各写一份记录，再删除本地压缩包。"
+	return "NASArchiveSync - 把 zip/7z/rar 归档通过 SMB、SFTP、S3 或本地文件夹复制/上传，SHA256 双向校验后在目标和本地各写一份记录，再删除本地压缩包。"
 }
 
 func (cliArgs) Version() string {
@@ -121,6 +128,14 @@ func (cliArgs) Epilogue() string {
   # 指定 SFTP 加密算法；auto 会优先使用实测最快的算法
   NASArchiveSync -s "C:\game" -t "sftp://user@192.168.12.1/mnt/hdd1/game" --sftp-cipher chacha20-poly1305@openssh.com
 
+  # S3 路径模式（IP/localhost endpoint 推荐）
+  $env:NAS_S3_ACCESS_KEY = "access-key"
+  $env:NAS_S3_SECRET_KEY = "secret-key"
+  NASArchiveSync -s "C:\game" -t "s3://oss/game" --s3-endpoint "http://192.168.1.5:3900" --s3-region garage --s3-style path
+
+  # S3 虚拟主机模式（endpoint 需要支持 oss.域名 解析）
+  NASArchiveSync -s "C:\game" -t "s3://oss/game" --s3-endpoint "http://192.168.1.5.nip.io:3900" --s3-region garage --s3-style virtual
+
 匹配模式:
   * 匹配任意字符，? 匹配单个字符，** 匹配多级目录，{a,b} 匹配多选一。
   不含 / 的模式匹配任意层级的目录名或文件名，例如 --exclude temp。
@@ -168,6 +183,18 @@ func run() int {
 	case "auto", "native", "builtin":
 	default:
 		logger.Errorf("--smb-mode 必须是 auto、native 或 builtin")
+		return 2
+	}
+
+	s3Style := strings.ToLower(strings.TrimSpace(args.S3Style))
+	switch s3Style {
+	case "auto", "path", "virtual":
+	default:
+		logger.Errorf("--s3-style 必须是 auto、path 或 virtual")
+		return 2
+	}
+	if (args.S3AccessKey == "") != (args.S3SecretKey == "") {
+		logger.Errorf("--s3-access-key 和 --s3-secret-key 必须同时提供")
 		return 2
 	}
 
@@ -258,6 +285,15 @@ func run() int {
 			Cipher:         args.SFTPCipher,
 			KnownHostsPath: args.SFTPKnown,
 			Insecure:       args.SFTPInsecure,
+		},
+		S3: app.S3Options{
+			Endpoint:     args.S3Endpoint,
+			Region:       args.S3Region,
+			AccessKey:    args.S3AccessKey,
+			SecretKey:    args.S3SecretKey,
+			SessionToken: args.S3SessionToken,
+			Style:        s3Style,
+			Insecure:     args.S3Insecure,
 		},
 		SMBMode:          smbMode,
 		SMBAuthRequested: args.SMBAskPass || args.SMBUser != "" || args.SMBPass != "" || args.SMBDomain != "",

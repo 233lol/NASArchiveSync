@@ -66,18 +66,30 @@ type Options struct {
 	Cipher          string
 	KnownHostsPath  string
 	InsecureHostKey bool
+
+	// S3 specific settings. They are ignored by other backends.
+	S3Endpoint     string
+	S3Region       string
+	S3AccessKey    string
+	S3SecretKey    string
+	S3SessionToken string
+	S3Style        string // auto, path or virtual
+	S3Insecure     bool
 }
 
 // Target is a parsed --target value.
 type Target struct {
-	Scheme   string // "smb", "sftp" or "local"
+	Scheme   string // "smb", "sftp", "s3" or "local"
 	User     string
 	Password string
 	Host     string
 	Port     int
 	Share    string
+	// Bucket is the S3 bucket name.
+	Bucket string
 	// Path is slash separated. SMB paths are relative to the share; SFTP and
-	// local paths are absolute and keep their leading slash.
+	// local paths are absolute and keep their leading slash; S3 paths are the
+	// key prefix inside the bucket.
 	Path string
 	Raw  string
 }
@@ -107,6 +119,7 @@ func (t Target) UNCPath() string {
 //	scp://user@host/mnt/hdd1/game     alias for SFTP (scp uses the SFTP subsystem)
 //	user@host:/mnt/hdd1/game          scp style absolute path (SFTP)
 //	192.168.12.1:/mnt/hdd1/game       scp style absolute path (SFTP)
+//	s3://oss/game/2026                S3 bucket and optional key prefix
 //	local:C:\game                     local directory (mainly for testing)
 //	local:///mnt/game                 local directory with URL syntax
 //	file:///C:/backup                 local directory with file URL syntax
@@ -189,6 +202,22 @@ func ParseTarget(raw string) (Target, error) {
 		t.Path = cleanRemotePath(u.Path)
 		return t, nil
 
+	case strings.HasPrefix(lower, "s3://"):
+		u, err := url.Parse(s)
+		if err != nil {
+			return Target{}, fmt.Errorf("解析 S3 地址失败: %w", err)
+		}
+		if u.Hostname() == "" {
+			return Target{}, fmt.Errorf("S3 地址缺少 bucket 名: %s", raw)
+		}
+		if u.Port() != "" {
+			return Target{}, fmt.Errorf("S3 端口请写在 --s3-endpoint 中，而不是 s3:// 地址里: %s", raw)
+		}
+		t.Scheme = "s3"
+		t.Bucket = u.Hostname()
+		t.Path = cleanKeyPrefix(u.Path)
+		return t, nil
+
 	case strings.HasPrefix(lower, "file://"):
 		u, err := url.Parse(s)
 		if err != nil {
@@ -240,8 +269,10 @@ func ParseTarget(raw string) (Target, error) {
 			return Target{}, fmt.Errorf("SMB 地址格式无效，请使用 smb://host/share/path 或 \\\\host\\share\\path: %s", raw)
 		case "file":
 			return Target{}, fmt.Errorf("本地文件地址格式无效，请使用 file:///C:/path 或直接写 C:\\path: %s", raw)
+		case "s3":
+			return Target{}, fmt.Errorf("S3 地址格式无效，请使用 s3://bucket/prefix: %s", raw)
 		}
-		return Target{}, fmt.Errorf("暂不支持协议 %q，目前支持 smb、sftp 与 local", scheme)
+		return Target{}, fmt.Errorf("暂不支持协议 %q，目前支持 smb、sftp、s3 与 local", scheme)
 	}
 
 	// Everything else is treated as a local file system path.
@@ -267,7 +298,7 @@ func parseScpLike(s string) (Target, bool) {
 		return Target{}, false
 	}
 	switch strings.ToLower(head) {
-	case "smb", "sftp", "scp", "local", "file", "http", "https", "ftp", "ftps", "nfs":
+	case "smb", "sftp", "scp", "s3", "local", "file", "http", "https", "ftp", "ftps", "nfs":
 		return Target{}, false
 	}
 	if !strings.HasPrefix(rest, "/") {
@@ -300,6 +331,17 @@ func cleanRemotePath(p string) string {
 		p = "/" + p
 	}
 	return path.Clean(p)
+}
+
+// cleanKeyPrefix normalises an S3 key prefix: no leading or trailing slash and
+// no "." or ".." segments.
+func cleanKeyPrefix(p string) string {
+	p = strings.TrimSpace(strings.ReplaceAll(p, `\`, "/"))
+	p = strings.Trim(p, "/")
+	if p == "" {
+		return ""
+	}
+	return strings.Trim(path.Clean("/"+p), "/")
 }
 
 func urlUsername(u *url.URL) string {

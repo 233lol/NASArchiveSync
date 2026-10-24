@@ -9,6 +9,7 @@ func TestParseTarget(t *testing.T) {
 		user    string
 		host    string
 		share   string
+		bucket  string
 		path    string
 		port    int
 		wantErr bool
@@ -24,6 +25,9 @@ func TestParseTarget(t *testing.T) {
 		{raw: `192.168.12.1:/mnt/hdd1/game`, scheme: "sftp", host: "192.168.12.1", path: "/mnt/hdd1/game"},
 		{raw: `user@nas:/mnt/game`, scheme: "sftp", user: "user", host: "nas", path: "/mnt/game"},
 		{raw: `nas:/mnt/game`, scheme: "sftp", host: "nas", path: "/mnt/game"},
+		{raw: `s3://oss/game/test`, scheme: "s3", bucket: "oss", path: "game/test"},
+		{raw: `s3://oss`, scheme: "s3", bucket: "oss"},
+		{raw: `s3://oss//game/../test/`, scheme: "s3", bucket: "oss", path: "test"},
 		{raw: `local:C:\game`, scheme: "local", path: `C:\game`},
 		{raw: `C:\game`, scheme: "local", path: `C:\game`},
 		{raw: `C:/game`, scheme: "local", path: `C:/game`},
@@ -38,6 +42,9 @@ func TestParseTarget(t *testing.T) {
 		{raw: `sftp://`, wantErr: true},
 		{raw: `sftp:foo`, wantErr: true},
 		{raw: `smb:foo`, wantErr: true},
+		{raw: `s3://`, wantErr: true},
+		{raw: `s3:foo`, wantErr: true},
+		{raw: `s3://oss:3900/game`, wantErr: true},
 		{raw: `ftp://nas/game`, wantErr: true},
 		{raw: ``, wantErr: true},
 	}
@@ -54,7 +61,7 @@ func TestParseTarget(t *testing.T) {
 			t.Errorf("%q: %v", tc.raw, err)
 			continue
 		}
-		if got.Scheme != tc.scheme || got.User != tc.user || got.Host != tc.host || got.Share != tc.share || got.Path != tc.path || got.Port != tc.port {
+		if got.Scheme != tc.scheme || got.User != tc.user || got.Host != tc.host || got.Share != tc.share || got.Bucket != tc.bucket || got.Path != tc.path || got.Port != tc.port {
 			t.Errorf("%q: got %+v", tc.raw, got)
 		}
 	}

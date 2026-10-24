@@ -52,6 +52,17 @@ type SFTPOptions struct {
 	Insecure       bool
 }
 
+// S3Options carries S3 credentials and endpoint settings.
+type S3Options struct {
+	Endpoint     string
+	Region       string
+	AccessKey    string
+	SecretKey    string
+	SessionToken string
+	Style        string
+	Insecure     bool
+}
+
 // Options configures a Run.
 type Options struct {
 	Source string
@@ -80,6 +91,7 @@ type Options struct {
 	CaseSensitive bool
 	SMB           SMBOptions
 	SFTP          SFTPOptions
+	S3            S3Options
 	// SMBMode is "auto" (default), "native" or "builtin". Native means the
 	// operating system's SMB redirector is used and existing Windows
 	// credentials are reused.
@@ -317,6 +329,17 @@ func Run(ctx context.Context, o Options) (Result, error) {
 		backendOpts.InsecureHostKey = o.SFTP.Insecure
 		if o.SFTP.Insecure {
 			log.Warnf("已禁用 SFTP 主机密钥校验（--sftp-insecure），连接可能被中间人攻击")
+		}
+	case "s3":
+		backendOpts.S3Endpoint = o.S3.Endpoint
+		backendOpts.S3Region = o.S3.Region
+		backendOpts.S3AccessKey = o.S3.AccessKey
+		backendOpts.S3SecretKey = o.S3.SecretKey
+		backendOpts.S3SessionToken = o.S3.SessionToken
+		backendOpts.S3Style = o.S3.Style
+		backendOpts.S3Insecure = o.S3.Insecure
+		if o.S3.Insecure {
+			log.Warnf("已禁用 S3 HTTPS 证书校验（--s3-insecure），连接可能被中间人攻击")
 		}
 	}
 	uploadBackend, err := backends.Open(target, backendOpts, nativeAccess)

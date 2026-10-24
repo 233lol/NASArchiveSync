@@ -1,7 +1,7 @@
 # NASArchiveSync
 
-把本地 `zip` / `7z` / `rar` 归档通过 SMB、SFTP 或本地文件夹复制/上传，读回文件做 SHA256
-双向校验，写入 `原名.txt` 上传记录，确认无误后再删除本地压缩包。
+把本地 `zip` / `7z` / `rar` 归档通过 SMB、SFTP、S3 对象存储或本地文件夹复制/上传，
+读回文件做 SHA256 双向校验，写入 `原名.txt` 上传记录，确认无误后再删除本地压缩包。
 
 ## 功能
 
@@ -11,6 +11,7 @@
 - 支持复用系统已添加的 SMB 路径：Windows 下可直接使用 UNC 路径或映射网络驱动器，沿用已登录凭据，无需在工具中填写密码
 - 支持 SFTP（含 `sftp://`、`scp://` 和 `user@host:/path` 写法），可用私钥或密码认证，默认校验 known_hosts
 - 目标也可以是本地文件夹（`C:\backup`、`local:C:\backup`、`file:///C:/backup`），同样做 SHA256 校验、写记录、删源
+- 支持 S3 兼容对象存储（Garage、MinIO、Ceph RGW、AWS S3），可选路径模式或虚拟主机/域名模式
 - SFTP 可选加密算法，默认 `aes128-gcm@openssh.com`（实测与 AES-256-GCM 并列最快且 CPU 更低），也可用 `--sftp-cipher` 指定
 - 上传时顺带计算本地 SHA256（`io.TeeReader`），新文件只读一遍本地磁盘
 - 上传后从 NAS 读回文件重新计算 SHA256，与本地比对
@@ -25,7 +26,7 @@
 - 进度显示百分比、已传/总大小、实时速度、ETA；按终端宽度和中文显示宽度自适应，不会因长文件名换行
 - 幂等：重复运行时已上传且校验一致的文件自动跳过
 - 先写临时文件再重命名，避免产生半截文件
-- 存储层抽象，当前支持 SMB、SFTP 与本地目录，方便后续扩展 FTP/NFS
+- 存储层抽象，当前支持 SMB、SFTP、S3 与本地目录，方便后续扩展 FTP/NFS
 
 ## 工作流程
 
@@ -40,7 +41,7 @@
 ```
 
 默认流水线模式下，第 N 个文件上传完成后立即开始上传第 N+1 个文件，同时由另一个
-连接（SMB/SFTP 或本地目标）校验第 N 个文件；校验仍然是完整的 SHA256 读回，不做采样或只比大小。
+连接（SMB/SFTP/S3 或本地目标）校验第 N 个文件；校验仍然是完整的 SHA256 读回，不做采样或只比大小。
 
 加 `--no-verify` 时会跳过“上传时哈希”和“读回校验”两步：文件上传成功后直接写记录
 （记录中注明未校验），然后按记录写入结果删除本地压缩包。此模式不启用流水线。
@@ -107,6 +108,7 @@ C:\game\a\z.7z.txt          # 本地记录保留
 | `scp://user@192.168.12.1/mnt/hdd1/game` | scp 写法，实际使用 SFTP 子系统 |
 | `user@192.168.12.1:/mnt/hdd1/game` | scp 简写，路径必须是绝对路径 |
 | `192.168.12.1:/mnt/hdd1/game` | 省略用户名，默认使用当前系统用户 |
+| `s3://oss/game` | S3 bucket `oss`，key 前缀 `game`；endpoint 用 `--s3-endpoint` 指定 |
 | `Z:\game` | 系统已映射的网络驱动器，直接当本地路径使用 |
 | `local:C:\test` | 本地目录，用于测试或本地归档 |
 | `file:///C:/test` | 本地目录的 file URL 写法 |
@@ -250,12 +252,81 @@ go test -c -o dist\sftpbench.test.exe .\internal\storage\sftp
 > 注意：Windows 防火墙可能拦截 `%TEMP%` 下的测试二进制，直接运行 `go test` 时若出现
 > `dial tcp ... i/o timeout`，请像上面那样先把测试二进制编译到 `dist\` 再运行。
 
+## S3 对象存储
+
+目标写成 `s3://bucket/key前缀`，endpoint、区域和凭据通过参数或环境变量提供：
+
+```powershell
+$env:NAS_S3_ACCESS_KEY = "access-key"
+$env:NAS_S3_SECRET_KEY = "secret-key"
+
+# 路径模式（Garage / MinIO 用 IP 或 localhost 时推荐）
+.\NASArchiveSync.exe -s "C:\game" -t "s3://oss/game" `
+  --s3-endpoint "http://192.168.1.5:3900" --s3-region garage --s3-style path
+
+# 虚拟主机 / 域名模式（endpoint 必须是域名，且 bucket.域名 能解析）
+.\NASArchiveSync.exe -s "C:\game" -t "s3://oss/game" `
+  --s3-endpoint "http://s3.example.com:3900" --s3-region garage --s3-style virtual
+
+# auto（默认）：IP/localhost/单段主机名用 path，域名用 virtual
+.\NASArchiveSync.exe -s "C:\game" -t "s3://oss/game" `
+  --s3-endpoint "http://192.168.1.5:3900" --s3-region garage
+```
+
+### 路径模式与域名模式
+
+| `--s3-style` | 实际请求 |
+|---|---|
+| `path` | `http://endpoint/bucket/key` |
+| `virtual` | `http://bucket.endpoint/key` |
+| `auto`（默认） | endpoint 是 IP、`localhost` 或单段主机名时用 `path`，否则用 `virtual` |
+
+虚拟主机模式需要服务端支持：Garage 需要在 `garage.toml` 的 `[s3_api]` 中配置
+`root_domain`（例如 `.s3.garage.localhost`），并为 `bucket.root_domain` 配置通配 DNS。
+只配置了路径模式的 Garage，使用 `virtual` 会返回 `NoSuchBucket`；此时请改用
+`--s3-style path`。路径模式在 Garage 上始终可用。
+
+本次测试环境 `http://192.168.1.5:3900` 只启用了路径模式：`--s3-style path` 已完成上传、
+校验、跳过、强制覆盖、`--no-verify`、multipart 上传和中文文件名测试；`--s3-style virtual`
+会正确生成 `http://oss.<endpoint>/...` 请求，但服务端返回 `NoSuchBucket`，需要先在 Garage
+配置 `root_domain` 和通配 DNS 才能使用。
+
+### 认证与 bucket
+
+- `--s3-access-key` / `--s3-secret-key`，或环境变量 `NAS_S3_ACCESS_KEY` / `NAS_S3_SECRET_KEY`
+- `--s3-session-token` / `NAS_S3_SESSION_TOKEN`（临时凭据）
+- 未提供静态凭据时，会走 AWS SDK 默认凭据链（环境变量 `AWS_*`、共享配置、实例角色等）
+- `--s3-region`，Garage 通常为 `garage`
+- `--s3-endpoint` 可省略，省略时使用 AWS 默认 endpoint；自定义服务建议显式填写
+- bucket 必须已存在，工具不会自动创建 bucket
+- 自签名 HTTPS 可用 `--s3-insecure` 跳过证书校验（仅测试环境）
+
+### 行为说明
+
+- S3 没有真实目录，`MkdirAll` 是空操作；key 前缀按 `/` 组织，控制台里会以目录形式展示
+- 上传先写 `<key>.nassync.tmp`，再通过 `CopyObject` 复制到正式 key 并删除临时 key
+- 超过 5 GiB 的对象自动使用分片复制（`UploadPartCopy`）
+- 大文件上传按 32 MiB 分片，使用 S3 multipart upload；小文件直接 `PutObject`
+- 为兼容 Garage/MinIO 等实现，默认不发送非必需的 checksum 头
+- 单文件超过 5 GiB 的正式上传和校验流程与 SMB/SFTP 完全一致，仍然做完整 SHA256 读回
+- 记录 txt 同样以对象形式写入 bucket，例如 `game/a.zip.txt`
+
+测试环境示例（`192.168.1.5:3900`、region `garage`、bucket `oss`）：
+
+```powershell
+$env:NAS_S3_ACCESS_KEY = "你的 Access Key ID"
+$env:NAS_S3_SECRET_KEY = "你的 Secret Access Key"
+
+.\NASArchiveSync.exe -s "C:\game" -t "s3://oss/game" `
+  --s3-endpoint "http://192.168.1.5:3900" --s3-region garage --s3-style path
+```
+
 ## 命令行参数
 
 | 参数 | 说明 |
 |---|---|
 | `-s, --source DIR` | 源目录，默认当前目录 |
-| `-t, --target ADDR` | 必填，目标目录（UNC / smb:// / sftp:// / scp:// / host:/path / 本地路径 / local: / file://） |
+| `-t, --target ADDR` | 必填，目标（UNC / smb:// / sftp:// / scp:// / host:/path / s3://bucket/prefix / 本地路径 / local: / file://） |
 | `--depth N` | 最大目录层数：`0` 仅源目录本身（默认），`-1` 不限，`1` 含一级子目录 |
 | `--with-source-dir` | 在目标目录下创建与源目录同名的文件夹后再上传 |
 | `-i, --include GLOB` | 只处理匹配的目录/文件，可重复指定 |
@@ -284,13 +355,21 @@ go test -c -o dist\sftpbench.test.exe .\internal\storage\sftp
 | `--sftp-cipher NAME` | SFTP 加密算法，默认 `auto`（优先 `aes128-gcm@openssh.com`） |
 | `--sftp-known-hosts PATH` | known_hosts 路径，默认 `~/.ssh/known_hosts` |
 | `--sftp-insecure` | 跳过 SFTP 主机密钥校验（不安全，仅建议测试环境） |
+| `--s3-endpoint URL` | S3 endpoint，如 `http://192.168.1.5:3900`；留空使用 AWS 默认端点 |
+| `--s3-region NAME` | S3 区域，默认 `us-east-1`；Garage 通常填 `garage` |
+| `--s3-access-key ID` | S3 Access Key ID（建议用 `NAS_S3_ACCESS_KEY`） |
+| `--s3-secret-key KEY` | S3 Secret Access Key（建议用 `NAS_S3_SECRET_KEY`） |
+| `--s3-session-token TOKEN` | S3 临时会话令牌（可选） |
+| `--s3-style MODE` | `auto`（默认）/`path`/`virtual`，见“路径模式与域名模式” |
+| `--s3-insecure` | 跳过 S3 HTTPS 证书校验（不安全，仅测试环境） |
 | `--txt MODE` | 上传记录保存位置：`both`（默认）/`local`/`remote`/`none` |
 | `--no-progress` | 关闭进度条 |
 | `-v, --verbose` | 输出调试日志 |
 | `--version` | 显示版本 |
 
 环境变量：`NAS_SMB_USER`、`NAS_SMB_PASS`、`NAS_SMB_DOMAIN`、`NAS_SFTP_USER`、`NAS_SFTP_PASS`、
-`NAS_SFTP_KEY`、`NAS_SFTP_KEY_PASS`。
+`NAS_SFTP_KEY`、`NAS_SFTP_KEY_PASS`、`NAS_S3_ENDPOINT`、`NAS_S3_REGION`、`NAS_S3_ACCESS_KEY`、
+`NAS_S3_SECRET_KEY`、`NAS_S3_SESSION_TOKEN`。
 
 ## 目录层数
 
@@ -439,7 +518,7 @@ SHA256: 3f2a...e91c
 源路径: C:\game\a\z.7z
 源文件修改时间: 2026-10-20 09:12:31 +08:00
 上传耗时: 28.4s
-工具版本: v0.4.1
+工具版本: v0.5.0
 ```
 
 记录使用 UTF-8 编码。幂等判断依赖 `SHA256` 与 `文件大小(字节)`。
@@ -466,7 +545,7 @@ SHA256: 未计算
 源路径: C:\game\a\z.7z
 源文件修改时间: 2026-10-20 09:12:31 +08:00
 上传耗时: 28.4s
-工具版本: v0.4.1
+工具版本: v0.5.0
 ```
 
 注意：
@@ -489,6 +568,9 @@ SHA256: 未计算
 
 - **流水线（默认）**：上传第 N+1 个文件的同时，用另一个 SMB/SFTP 会话校验第 N 个文件；两者互不阻塞，适合多个大文件。校验仍是完整读回 + SHA256。加 `--no-pipeline` 可恢复逐文件顺序处理；`--no-verify` 下没有校验步骤，自动按顺序上传。
 - **SFTP 主机密钥**：默认严格校验 `~/.ssh/known_hosts`；`--sftp-insecure` 会关闭校验并打印警告。密码优先用环境变量或 `--sftp-ask-pass`，避免进入命令历史。
+- **S3 桶**：只使用已存在的 bucket，不会自动创建；`s3://bucket/prefix` 中的 prefix 是对象 key 前缀，不是真实目录。
+- **S3 重命名**：对象存储没有 rename，工具用 copy + delete 实现；超过 5 GiB 自动改用分片复制。
+- **S3 兼容性**：默认不发送非必需的 checksum 头，避免 Garage/MinIO 等实现拒绝请求；对象存储的最终一致性由服务端保证。
 - **上传即哈希（默认）**：新文件上传时用 `io.TeeReader` 顺带计算本地 SHA256，本地只读一遍；跳过判断、`--recheck` 等场景仍会单独读本地文件。`--no-verify` 下不计算哈希。
 - **关闭校验**：`--no-verify` 不计算 SHA256、不读回远端，记录标记为未校验；成功后仍按记录写入结果删除本地文件，详见“关闭校验”章节。
 - **失败不删源**：上传失败、校验不一致、所需记录写入失败都会保留本地文件。
@@ -536,7 +618,7 @@ type Backend interface {
 
 新增协议只需：
 
-1. 在 `internal/storage/<proto>` 实现 `Backend`（可参考 `local`、`smb` 与 `sftp`）
+1. 在 `internal/storage/<proto>` 实现 `Backend`（可参考 `local`、`smb`、`sftp` 与 `s3`）
 2. 在 `internal/storage.ParseTarget` 中识别新的地址前缀
 3. 在 `internal/backends/backends.go` 中注册实现
 
@@ -550,6 +632,9 @@ go vet ./...
 端到端测试使用 `local:` 后端，覆盖上传、校验、记录、删源、dry-run、层数、幂等、冲突、强制覆盖、远端损坏检测，以及 `--no-verify` 的上传、按记录跳过、冲突和强制覆盖。
 
 SFTP 相关单元测试覆盖目标地址解析、加密算法选择、known_hosts 损坏行容错和主机密钥重试判断。
+S3 相关单元测试覆盖目标地址解析、auto 模式选择、endpoint 规范化、CopySource 转义，以及
+用本地 httptest 服务器验证 path/virtual 两种请求布局、上传、复制重命名和 Stat。
+
 真实链路的加密算法吞吐测试见“SFTP / SCP 上传”章节，默认跳过，不会在普通 `go test` 中访问网络。
 
 ## 常见问题
@@ -580,6 +665,20 @@ SFTP 相关单元测试覆盖目标地址解析、加密算法选择、known_hos
 可以。`--target` 直接写 `D:\backup\game`、`local:D:\backup\game` 或 `file:///D:/backup/game`。
 流程与 NAS 一样：自动建目录、SHA256 校验、写 txt、成功后删除源压缩包（`--keep-source` 可保留）。
 目标不能与源目录相同；目标在源目录内时会被自动跳过。
+
+**Q：S3 连接失败 / 认证失败？**
+确认 `--s3-endpoint` 带协议（`http://` 或 `https://`）、`--s3-region`（Garage 常用 `garage`）
+和 Access Key/Secret Key 是否正确。先执行 `--dry-run`，它只做 `HeadBucket` 和 `Stat`，不会写入。
+如果使用临时凭据，补上 `--s3-session-token`。
+
+**Q：S3 路径模式和域名模式怎么选？**
+IP、`localhost` 或 MinIO/Garage 的普通地址用 `--s3-style path`。域名模式需要服务端支持
+virtual-host：Garage 要配置 `[s3_api].root_domain` 和通配 DNS，MinIO 也要能解析
+`bucket.域名`。如果 `virtual` 返回 `NoSuchBucket`，说明服务端没有启用该模式，改用 `path`。
+
+**Q：S3 bucket 不存在会自动创建吗？**
+不会。请先在 Garage/MinIO/AWS 控制台或 CLI 创建 bucket；工具启动时会用 `HeadBucket` 检查，
+不存在会直接报错。
 
 **Q：提示目标已存在且没有有效上传记录？**
 说明远端已有同名文件但不是本工具写入的，或 SHA256 与本地不同。确认后可加 `--force`。`--no-verify` 下没有 SHA256，只能比较记录中的大小和修改时间，没有匹配记录时同样需要 `--force`。
