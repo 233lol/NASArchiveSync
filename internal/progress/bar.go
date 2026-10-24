@@ -7,13 +7,15 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mattn/go-runewidth"
+
 	"github.com/fjf/NASArchiveSync/internal/console"
 	"github.com/fjf/NASArchiveSync/internal/humanize"
 )
 
 const (
 	barWidth    = 24
-	redrawEvery = 120 * time.Millisecond
+	redrawEvery = 80 * time.Millisecond
 )
 
 // Bar renders a single line progress bar with percentage, transferred bytes,
@@ -33,6 +35,7 @@ type Bar struct {
 	lastAt    time.Time
 	lastBytes int64
 	speed     float64
+	lastWidth int
 }
 
 // New creates a progress bar. The bar disables itself when out is not a
@@ -82,8 +85,26 @@ func (b *Bar) Set(n int64) {
 }
 
 func (b *Bar) drawLocked() {
+	if b.out != nil {
+		if w := console.Width(b.out, b.width); w > 0 {
+			b.width = w
+		}
+	}
 	line := b.renderLine(time.Now())
-	fmt.Fprintf(b.out, "\r%s\x1b[K", line)
+	lineWidth := runewidth.StringWidth(line)
+
+	// Pad with spaces to erase the previous, possibly longer line. This avoids
+	// ANSI escape sequences, which are not understood by every Windows console.
+	clearWidth := b.lastWidth
+	if max := b.width - 1; clearWidth > max {
+		clearWidth = max
+	}
+	pad := 0
+	if clearWidth > lineWidth {
+		pad = clearWidth - lineWidth
+	}
+	fmt.Fprintf(b.out, "\r%s%s", line, strings.Repeat(" ", pad))
+	b.lastWidth = lineWidth
 }
 
 // renderLine builds the visible bar line and updates the speed estimate.
@@ -147,13 +168,13 @@ func (b *Bar) renderLine(now time.Time) string {
 	}
 
 	stats := " " + strings.Join(parts, " ")
-	maxLabel := b.width - runeLen(stats) - 1
+	maxLabel := b.width - runewidth.StringWidth(stats) - 1
 	if maxLabel < 0 {
 		maxLabel = 0
 	}
-	line := truncate(b.label, maxLabel) + stats
-	if runeLen(line) > b.width-1 {
-		line = truncate(line, b.width-1)
+	line := runewidth.Truncate(b.label, maxLabel, "...") + stats
+	if runewidth.StringWidth(line) > b.width-1 {
+		line = runewidth.Truncate(line, b.width-1, "...")
 	}
 	return line
 }
@@ -206,22 +227,4 @@ func (r *Reader) Read(p []byte) (int, error) {
 		r.bar.Add(int64(n))
 	}
 	return n, err
-}
-
-func runeLen(s string) int {
-	return len([]rune(s))
-}
-
-func truncate(s string, max int) string {
-	if max <= 0 {
-		return ""
-	}
-	r := []rune(s)
-	if len(r) <= max {
-		return s
-	}
-	if max <= 3 {
-		return string(r[:max])
-	}
-	return string(r[:max-3]) + "..."
 }

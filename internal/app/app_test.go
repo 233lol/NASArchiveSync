@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -635,6 +636,82 @@ func TestSourceDirName(t *testing.T) {
 	root := filepath.VolumeName(t.TempDir()) + string(filepath.Separator)
 	if _, err := sourceDirName(root); err == nil {
 		t.Errorf("sourceDirName(%q) should fail for a volume root", root)
+	}
+}
+
+func TestRunListPrintsAllMatches(t *testing.T) {
+	src := t.TempDir()
+	writeSourceFile(t, src, "root.zip", "r")
+	writeSourceFile(t, src, "[abc]/a.7z", "a")
+	writeSourceFile(t, src, "other/b.rar", "b")
+	writeSourceFile(t, src, "other/c.txt", "c")
+
+	var buf bytes.Buffer
+	opts := testOptions(src, "")
+	opts.Target = ""
+	opts.Depth = -1
+	opts.Extensions = nil
+	opts.List = true
+	opts.ListOut = &buf
+
+	res, err := Run(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	want := "[abc]/a.7z\nother/b.rar\nroot.zip\n"
+	if got := buf.String(); got != want {
+		t.Errorf("list output = %q, want %q", got, want)
+	}
+	if res.Total != 3 {
+		t.Errorf("Total = %d, want 3", res.Total)
+	}
+	if !exists(filepath.Join(src, "[abc]", "a.7z")) || !exists(filepath.Join(src, "root.zip")) {
+		t.Error("--list must not delete or move source files")
+	}
+}
+
+func TestRunListAppliesIncludePattern(t *testing.T) {
+	src := t.TempDir()
+	writeSourceFile(t, src, "[abc]/a.7z", "a")
+	writeSourceFile(t, src, "[abc]/sub/b.zip", "b")
+	writeSourceFile(t, src, "other/c.zip", "c")
+
+	var buf bytes.Buffer
+	opts := testOptions(src, "")
+	opts.Target = ""
+	opts.Depth = -1
+	opts.Include = []string{"[[]*]"}
+	opts.List = true
+	opts.ListOut = &buf
+
+	res, err := Run(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	want := "[abc]/a.7z\n[abc]/sub/b.zip\n"
+	if got := buf.String(); got != want {
+		t.Errorf("list output = %q, want %q", got, want)
+	}
+	if res.Total != 2 {
+		t.Errorf("Total = %d, want 2", res.Total)
+	}
+}
+
+func TestRunListNeedsNoTarget(t *testing.T) {
+	src := t.TempDir()
+	writeSourceFile(t, src, "a.zip", "a")
+
+	var buf bytes.Buffer
+	opts := testOptions(src, "")
+	opts.Target = ""
+	opts.List = true
+	opts.ListOut = &buf
+
+	if _, err := Run(context.Background(), opts); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := buf.String(); got != "a.zip\n" {
+		t.Errorf("list output = %q", got)
 	}
 }
 

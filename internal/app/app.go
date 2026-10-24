@@ -47,6 +47,9 @@ type Options struct {
 	// instead of directly into the target root. For example source C:\game\a
 	// and target \\nas\share\game produces \\nas\share\game\a\....
 	WithSourceDir bool
+	// List only prints the matched archive files. No target is required and no
+	// storage backend is opened or modified.
+	List          bool
 	Include       []string
 	Exclude       []string
 	Extensions    []string
@@ -66,6 +69,7 @@ type Options struct {
 	Version          string
 	Logger           *xlog.Logger
 	ProgressOut      io.Writer
+	ListOut          io.Writer
 	Now              func() time.Time
 
 	// sourcePrefix is the source directory name used when WithSourceDir is set.
@@ -162,25 +166,12 @@ func Run(ctx context.Context, o Options) (Result, error) {
 		return res, fmt.Errorf("源路径不是目录: %s", srcRoot)
 	}
 
-	if o.WithSourceDir {
+	if o.WithSourceDir && !o.List {
 		name, nameErr := sourceDirName(srcRoot)
 		if nameErr != nil {
 			return res, nameErr
 		}
 		o.sourcePrefix = name
-	}
-
-	target, err := storage.ParseTarget(o.Target)
-	if err != nil {
-		return res, err
-	}
-
-	nativeAccess, err := useNativeSMB(target, o)
-	if err != nil {
-		return res, err
-	}
-	if nativeAccess && o.SMBAuthRequested {
-		log.Warnf("系统级 SMB 访问会复用 Windows 已登录凭据，--smb-user/--smb-pass 等参数将被忽略")
 	}
 
 	scanOpts := scan.Options{
@@ -191,23 +182,41 @@ func Run(ctx context.Context, o Options) (Result, error) {
 		Extensions:    o.Extensions,
 		CaseSensitive: o.CaseSensitive,
 	}
-	if target.Scheme == "local" {
-		if localRoot, absErr := filepath.Abs(target.Path); absErr == nil {
-			if samePath(localRoot, srcRoot) {
-				return res, fmt.Errorf("本地目标目录不能与源目录相同: %s", localRoot)
-			}
-			// With --with-source-dir the upload root is target/<source name>;
-			// reject the case where that resolves back to the source directory,
-			// which would overwrite the archives being uploaded.
-			if o.sourcePrefix != "" {
-				effective := filepath.Join(localRoot, o.sourcePrefix)
-				if samePath(effective, srcRoot) {
-					return res, fmt.Errorf("在目标目录下创建源目录同名文件夹后会与源目录相同: %s（请改用上一级目标目录或去掉 --with-source-dir）", effective)
+
+	var target storage.Target
+	nativeAccess := false
+	if !o.List {
+		target, err = storage.ParseTarget(o.Target)
+		if err != nil {
+			return res, err
+		}
+
+		nativeAccess, err = useNativeSMB(target, o)
+		if err != nil {
+			return res, err
+		}
+		if nativeAccess && o.SMBAuthRequested {
+			log.Warnf("系统级 SMB 访问会复用 Windows 已登录凭据，--smb-user/--smb-pass 等参数将被忽略")
+		}
+
+		if target.Scheme == "local" {
+			if localRoot, absErr := filepath.Abs(target.Path); absErr == nil {
+				if samePath(localRoot, srcRoot) {
+					return res, fmt.Errorf("本地目标目录不能与源目录相同: %s", localRoot)
 				}
-			}
-			if isWithin(localRoot, srcRoot) {
-				scanOpts.SkipDirs = append(scanOpts.SkipDirs, localRoot)
-				log.Debugf("目标目录位于源目录内，已跳过: %s", localRoot)
+				// With --with-source-dir the upload root is target/<source name>;
+				// reject the case where that resolves back to the source directory,
+				// which would overwrite the archives being uploaded.
+				if o.sourcePrefix != "" {
+					effective := filepath.Join(localRoot, o.sourcePrefix)
+					if samePath(effective, srcRoot) {
+						return res, fmt.Errorf("在目标目录下创建源目录同名文件夹后会与源目录相同: %s（请改用上一级目标目录或去掉 --with-source-dir）", effective)
+					}
+				}
+				if isWithin(localRoot, srcRoot) {
+					scanOpts.SkipDirs = append(scanOpts.SkipDirs, localRoot)
+					log.Debugf("目标目录位于源目录内，已跳过: %s", localRoot)
+				}
 			}
 		}
 	}
@@ -220,6 +229,18 @@ func Run(ctx context.Context, o Options) (Result, error) {
 		log.Warnf("%v", warning)
 	}
 	res.Total = len(files)
+
+	if o.List {
+		out := o.ListOut
+		if out == nil {
+			out = os.Stdout
+		}
+		for _, file := range files {
+			fmt.Fprintln(out, file.Rel)
+		}
+		res.Duration = time.Since(started)
+		return res, nil
+	}
 
 	log.Infof("源目录: %s", srcRoot)
 	if o.DryRun {

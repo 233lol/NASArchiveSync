@@ -22,9 +22,10 @@ var version = "0.1.0"
 
 type cliArgs struct {
 	Source        string   `arg:"-s,--source" default:"." help:"源目录，默认为当前目录"`
-	Target        string   `arg:"-t,--target,required" help:"目标目录，如 \\\\192.168.12.1\\mnt\\hdd1\\game 或 smb://192.168.12.1/mnt/hdd1/game"`
+	Target        string   `arg:"-t,--target" help:"目标目录，如 \\\\192.168.12.1\\mnt\\hdd1\\game 或 smb://192.168.12.1/mnt/hdd1/game（--list 时可省略）"`
 	Depth         int      `arg:"--depth" default:"0" help:"最大目录层数：0 仅源目录本身（默认），-1 不限，1 含一级子目录"`
 	WithSourceDir bool     `arg:"--with-source-dir" help:"在目标目录下创建与源目录同名的文件夹后再上传，如 源 C:\\game\\a → 目标\\game\\a"`
+	List          bool     `arg:"-l,--list" help:"只列出匹配到的归档文件，不上传、不写记录、不删除（可省略 --target）"`
 	Include       []string `arg:"-i,--include,separate" help:"只处理匹配的目录/文件，可重复使用"`
 	Exclude       []string `arg:"-e,--exclude,separate" help:"排除匹配的目录/文件，可重复使用"`
 	Exts          []string `arg:"--ext,separate" help:"归档扩展名，默认 zip,7z,rar，可重复使用"`
@@ -80,6 +81,12 @@ func (cliArgs) Epilogue() string {
   # 源 C:\game\a → \\192.168.12.1\mnt\hdd1\game\a
   NASArchiveSync -s "C:\game\a" -t "\\192.168.12.1\mnt\hdd1\game" --depth 1 --with-source-dir
 
+  # 只列出匹配到的文件，不上传也不写记录（可省略 --target）
+  NASArchiveSync -s "C:\game" --depth 1 --include "[[]*]" --list
+
+  # 只列出所有 zip/7z/rar 的相对路径
+  NASArchiveSync -s "C:\game" --depth -1 --list
+
 匹配模式:
   * 匹配任意字符，? 匹配单个字符，** 匹配多级目录，{a,b} 匹配多选一。
   不含 / 的模式匹配任意层级的目录名或文件名，例如 --exclude temp。
@@ -99,6 +106,10 @@ func run() int {
 
 	if args.Depth < -1 {
 		logger.Errorf("--depth 不能小于 -1")
+		return 2
+	}
+	if !args.List && strings.TrimSpace(args.Target) == "" {
+		logger.Errorf("--target 必填（仅 --list 模式可省略，使用 --help 查看用法）")
 		return 2
 	}
 	if args.SMBPort <= 0 || args.SMBPort > 65535 {
@@ -121,7 +132,7 @@ func run() int {
 	}
 
 	password := args.SMBPass
-	if args.SMBAskPass && smbMode != "native" {
+	if args.SMBAskPass && !args.List && smbMode != "native" {
 		if !console.IsTerminal(os.Stdin) {
 			logger.Errorf("当前环境无法交互输入密码，请改用 --smb-pass 或 NAS_SMB_PASS")
 			return 2
@@ -149,6 +160,7 @@ func run() int {
 		Target:        args.Target,
 		Depth:         args.Depth,
 		WithSourceDir: args.WithSourceDir,
+		List:          args.List,
 		Include:       args.Include,
 		Exclude:       args.Exclude,
 		Extensions:    exts,
@@ -169,14 +181,22 @@ func run() int {
 		NoProgress:       args.NoProgress,
 		Version:          "v" + version,
 		Logger:           logger,
-		ProgressOut:      os.Stderr,
+		ProgressOut:      os.Stdout,
+		ListOut:          os.Stdout,
 	})
 	if err != nil {
 		logger.Errorf("%v", err)
-		if res.Duration > 0 {
+		if res.Duration > 0 && !args.List {
 			app.PrintResult(os.Stdout, res)
 		}
 		return 1
+	}
+
+	if args.List {
+		if res.Failed > 0 {
+			return 1
+		}
+		return 0
 	}
 
 	app.PrintResult(os.Stdout, res)
