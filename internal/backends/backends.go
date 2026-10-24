@@ -11,6 +11,7 @@ import (
 	"github.com/fjf/NASArchiveSync/internal/storage/s3"
 	"github.com/fjf/NASArchiveSync/internal/storage/sftp"
 	"github.com/fjf/NASArchiveSync/internal/storage/smb"
+	"github.com/fjf/NASArchiveSync/internal/storage/webdav"
 )
 
 // Open opens the backend for t. When native is true an SMB target is accessed
@@ -26,6 +27,8 @@ func Open(t storage.Target, opt storage.Options, nativeAccess bool) (storage.Bac
 		return sftp.Open(t, opt)
 	case "s3":
 		return s3.Open(t, opt)
+	case "webdav":
+		return webdav.Open(t, opt)
 	case "local":
 		return local.Open(t, opt)
 	default:

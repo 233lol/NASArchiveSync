@@ -90,6 +90,9 @@ type Options struct {
 	S3Insecure     bool
 	S3PartSize     int64 // multipart part size in bytes
 	S3Concurrency  int   // concurrent part uploads
+
+	// WebDAV specific settings. Credentials use User/Password.
+	WebDAVInsecure bool
 	// ReuseBuffers hints that several files will be written in one run, so a
 	// backend may keep its write buffers warm between files.
 	ReuseBuffers bool
@@ -97,7 +100,7 @@ type Options struct {
 
 // Target is a parsed --target value.
 type Target struct {
-	Scheme   string // "smb", "sftp", "s3" or "local"
+	Scheme   string // "smb", "sftp", "s3", "webdav" or "local"
 	User     string
 	Password string
 	Host     string
@@ -105,11 +108,14 @@ type Target struct {
 	Share    string
 	// Bucket is the S3 bucket name.
 	Bucket string
-	// Path is slash separated. SMB paths are relative to the share; SFTP and
-	// local paths are absolute and keep their leading slash; S3 paths are the
-	// key prefix inside the bucket.
+	// Path is slash separated. SMB paths are relative to the share; SFTP,
+	// WebDAV and local paths are absolute and keep their leading slash; S3
+	// paths are the key prefix inside the bucket.
 	Path string
-	Raw  string
+	// TLS selects HTTPS for WebDAV. It is false for plain webdav:// and true
+	// for webdavs://, davs:// and https:// targets.
+	TLS bool
+	Raw string
 }
 
 // UNCPath returns the \\host\share\path form of an SMB target. It is used by
@@ -138,6 +144,10 @@ func (t Target) UNCPath() string {
 //	user@host:/mnt/hdd1/game          scp style absolute path (SFTP)
 //	192.168.12.1:/mnt/hdd1/game       scp style absolute path (SFTP)
 //	s3://oss/game/2026                S3 bucket and optional key prefix
+//	webdav://user@host/dav/game       WebDAV over HTTP
+//	webdavs://user@host/dav/game      WebDAV over HTTPS
+//	dav://user@host/dav/game          alias for webdav://
+//	https://user@host/dav/game        HTTP(S) URLs are treated as WebDAV too
 //	local:C:\game                     local directory (mainly for testing)
 //	local:///mnt/game                 local directory with URL syntax
 //	file:///C:/backup                 local directory with file URL syntax
@@ -236,6 +246,37 @@ func ParseTarget(raw string) (Target, error) {
 		t.Path = cleanKeyPrefix(u.Path)
 		return t, nil
 
+	case strings.HasPrefix(lower, "webdav://"), strings.HasPrefix(lower, "webdavs://"),
+		strings.HasPrefix(lower, "dav://"), strings.HasPrefix(lower, "davs://"),
+		strings.HasPrefix(lower, "http://"), strings.HasPrefix(lower, "https://"):
+		u, err := url.Parse(s)
+		if err != nil {
+			return Target{}, fmt.Errorf("解析 WebDAV 地址失败: %w", err)
+		}
+		if u.Hostname() == "" {
+			return Target{}, fmt.Errorf("WebDAV 地址缺少主机名: %s", raw)
+		}
+		if u.RawQuery != "" || u.Fragment != "" {
+			return Target{}, fmt.Errorf("WebDAV 地址不支持查询参数或片段: %s", raw)
+		}
+		port := 0
+		if p := u.Port(); p != "" {
+			port, err = strconv.Atoi(p)
+			if err != nil || port <= 0 || port > 65535 {
+				return Target{}, fmt.Errorf("WebDAV 端口无效: %s", p)
+			}
+		}
+		t.Scheme = "webdav"
+		t.TLS = strings.HasPrefix(lower, "webdavs://") ||
+			strings.HasPrefix(lower, "davs://") ||
+			strings.HasPrefix(lower, "https://")
+		t.User = urlUsername(u)
+		t.Password = urlPassword(u)
+		t.Host = u.Hostname()
+		t.Port = port
+		t.Path = cleanRemotePath(u.Path)
+		return t, nil
+
 	case strings.HasPrefix(lower, "file://"):
 		u, err := url.Parse(s)
 		if err != nil {
@@ -289,8 +330,10 @@ func ParseTarget(raw string) (Target, error) {
 			return Target{}, fmt.Errorf("本地文件地址格式无效，请使用 file:///C:/path 或直接写 C:\\path: %s", raw)
 		case "s3":
 			return Target{}, fmt.Errorf("S3 地址格式无效，请使用 s3://bucket/prefix: %s", raw)
+		case "webdav", "dav", "webdavs", "davs", "http", "https":
+			return Target{}, fmt.Errorf("WebDAV 地址格式无效，请使用 webdav://host/path、webdavs://host/path 或 http(s)://host/path: %s", raw)
 		}
-		return Target{}, fmt.Errorf("暂不支持协议 %q，目前支持 smb、sftp、s3 与 local", scheme)
+		return Target{}, fmt.Errorf("暂不支持协议 %q，目前支持 smb、sftp、s3、webdav 与 local", scheme)
 	}
 
 	// Everything else is treated as a local file system path.
@@ -316,7 +359,7 @@ func parseScpLike(s string) (Target, bool) {
 		return Target{}, false
 	}
 	switch strings.ToLower(head) {
-	case "smb", "sftp", "scp", "s3", "local", "file", "http", "https", "ftp", "ftps", "nfs":
+	case "smb", "sftp", "scp", "s3", "webdav", "dav", "webdavs", "davs", "local", "file", "http", "https", "ftp", "ftps", "nfs":
 		return Target{}, false
 	}
 	if !strings.HasPrefix(rest, "/") {

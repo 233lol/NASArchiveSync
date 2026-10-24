@@ -65,6 +65,14 @@ type S3Options struct {
 	Concurrency  int
 }
 
+// WebDAVOptions carries WebDAV credentials. The server address and path are
+// part of --target.
+type WebDAVOptions struct {
+	User     string
+	Password string
+	Insecure bool
+}
+
 // Options configures a Run.
 type Options struct {
 	Source string
@@ -97,6 +105,7 @@ type Options struct {
 	SMB               SMBOptions
 	SFTP              SFTPOptions
 	S3                S3Options
+	WebDAV            WebDAVOptions
 	// SMBMode is "auto" (default), "native" or "builtin". Native means the
 	// operating system's SMB redirector is used and existing Windows
 	// credentials are reused.
@@ -362,6 +371,13 @@ func Run(ctx context.Context, o Options) (Result, error) {
 		backendOpts.S3Concurrency = o.S3.Concurrency
 		if o.S3.Insecure {
 			log.Warnf("已禁用 S3 HTTPS 证书校验（--s3-insecure），连接可能被中间人攻击")
+		}
+	case "webdav":
+		backendOpts.User = o.WebDAV.User
+		backendOpts.Password = o.WebDAV.Password
+		backendOpts.WebDAVInsecure = o.WebDAV.Insecure
+		if o.WebDAV.Insecure {
+			log.Warnf("已禁用 WebDAV HTTPS 证书校验（--webdav-insecure），连接可能被中间人攻击")
 		}
 	}
 	uploadBackend, err := backends.Open(target, backendOpts, nativeAccess)

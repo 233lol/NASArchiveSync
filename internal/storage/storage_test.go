@@ -7,11 +7,13 @@ func TestParseTarget(t *testing.T) {
 		raw     string
 		scheme  string
 		user    string
+		pass    string
 		host    string
 		share   string
 		bucket  string
 		path    string
 		port    int
+		tls     bool
 		wantErr bool
 	}{
 		{raw: `\\192.168.12.1\mnt\hdd1\game`, scheme: "smb", host: "192.168.12.1", share: "mnt", path: "hdd1/game"},
@@ -28,6 +30,14 @@ func TestParseTarget(t *testing.T) {
 		{raw: `s3://oss/game/test`, scheme: "s3", bucket: "oss", path: "game/test"},
 		{raw: `s3://oss`, scheme: "s3", bucket: "oss"},
 		{raw: `s3://oss//game/../test/`, scheme: "s3", bucket: "oss", path: "test"},
+		{raw: `webdav://test:secret@192.168.1.5:5200/dav/game`, scheme: "webdav", user: "test", pass: "secret", host: "192.168.1.5", path: "/dav/game", port: 5200},
+		{raw: `webdavs://user@nas/dav`, scheme: "webdav", user: "user", host: "nas", path: "/dav", tls: true},
+		{raw: `dav://nas/dav/game`, scheme: "webdav", host: "nas", path: "/dav/game"},
+		{raw: `davs://nas/dav`, scheme: "webdav", host: "nas", path: "/dav", tls: true},
+		{raw: `http://user:pass@nas:8080/dav/../game`, scheme: "webdav", user: "user", pass: "pass", host: "nas", path: "/game", port: 8080},
+		{raw: `https://nas/dav/%E4%B8%AD%E6%96%87`, scheme: "webdav", host: "nas", path: "/dav/中文", tls: true},
+		{raw: `webdav://nas`, scheme: "webdav", host: "nas", path: "/"},
+		{raw: `webdav://[::1]:5200/dav`, scheme: "webdav", host: "::1", path: "/dav", port: 5200},
 		{raw: `local:C:\game`, scheme: "local", path: `C:\game`},
 		{raw: `C:\game`, scheme: "local", path: `C:\game`},
 		{raw: `C:/game`, scheme: "local", path: `C:/game`},
@@ -45,6 +55,10 @@ func TestParseTarget(t *testing.T) {
 		{raw: `s3://`, wantErr: true},
 		{raw: `s3:foo`, wantErr: true},
 		{raw: `s3://oss:3900/game`, wantErr: true},
+		{raw: `webdav://`, wantErr: true},
+		{raw: `webdav://nas/dav?x=1`, wantErr: true},
+		{raw: `webdav:foo`, wantErr: true},
+		{raw: `http:foo`, wantErr: true},
 		{raw: `ftp://nas/game`, wantErr: true},
 		{raw: ``, wantErr: true},
 	}
@@ -61,7 +75,7 @@ func TestParseTarget(t *testing.T) {
 			t.Errorf("%q: %v", tc.raw, err)
 			continue
 		}
-		if got.Scheme != tc.scheme || got.User != tc.user || got.Host != tc.host || got.Share != tc.share || got.Bucket != tc.bucket || got.Path != tc.path || got.Port != tc.port {
+		if got.Scheme != tc.scheme || got.User != tc.user || got.Password != tc.pass || got.Host != tc.host || got.Share != tc.share || got.Bucket != tc.bucket || got.Path != tc.path || got.Port != tc.port || got.TLS != tc.tls {
 			t.Errorf("%q: got %+v", tc.raw, got)
 		}
 	}

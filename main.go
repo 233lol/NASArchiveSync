@@ -20,11 +20,11 @@ import (
 
 // version is overridden at build time via
 // -ldflags "-X main.version=x.y.z".
-var version = "0.7.1"
+var version = "0.8.0"
 
 type cliArgs struct {
 	Source         string   `arg:"-s,--source" default:"." help:"源目录，默认为当前目录"`
-	Target         string   `arg:"-t,--target" help:"目标：\\\\host\\share\\dir、smb://host/share/dir、sftp://user@host/dir、s3://bucket/prefix，或本地文件夹 C:\\backup（--list 时可省略）"`
+	Target         string   `arg:"-t,--target" help:"目标：\\\\host\\share\\dir、smb://host/share/dir、sftp://user@host/dir、s3://bucket/prefix、webdav://host/dav/dir，或本地文件夹 C:\\backup（--list 时可省略）"`
 	Depth          int      `arg:"--depth" default:"0" help:"最大目录层数：0 仅源目录本身（默认），-1 不限，1 含一级子目录"`
 	WithSourceDir  bool     `arg:"--with-source-dir" help:"在目标目录下创建与源目录同名的文件夹后再上传，如 源 C:\\game\\a → 目标\\game\\a"`
 	List           bool     `arg:"-l,--list" help:"只列出匹配到的归档文件，不上传、不写记录、不删除（可省略 --target）"`
@@ -37,7 +37,7 @@ type cliArgs struct {
 	KeepSource     bool     `arg:"--keep-source" help:"上传成功后保留本地压缩包"`
 	Force          bool     `arg:"--force" help:"目标已存在且内容不一致时覆盖"`
 	Recheck        bool     `arg:"--recheck" help:"跳过已上传文件时重新读回远端校验 SHA256"`
-	VerifyConc     int      `arg:"--verify-concurrency" default:"4" help:"远端校验的并发读连接数，默认 4；1 表示顺序读取（需要后端支持分片读取，S3 支持）"`
+	VerifyConc     int      `arg:"--verify-concurrency" default:"4" help:"远端校验的并发读连接数，默认 4；1 表示顺序读取（需要后端支持分片读取，S3/WebDAV 支持）"`
 	CaseSensitive  bool     `arg:"--case-sensitive" help:"包含/排除模式区分大小写（默认不区分）"`
 	SMBUser        string   `arg:"--smb-user,env:NAS_SMB_USER" help:"SMB 用户名，留空表示匿名"`
 	SMBPass        string   `arg:"--smb-pass,env:NAS_SMB_PASS" help:"SMB 密码，建议使用环境变量 NAS_SMB_PASS"`
@@ -54,6 +54,10 @@ type cliArgs struct {
 	SFTPCipher     string   `arg:"--sftp-cipher" default:"auto" help:"SFTP 加密算法：auto（默认，自动选择最快）、aes128-gcm@openssh.com、aes256-gcm@openssh.com、chacha20-poly1305@openssh.com、aes128-ctr、aes192-ctr、aes256-ctr"`
 	SFTPKnown      string   `arg:"--sftp-known-hosts" help:"known_hosts 路径，默认 ~/.ssh/known_hosts"`
 	SFTPInsecure   bool     `arg:"--sftp-insecure" help:"跳过 SFTP 主机密钥校验（不安全，仅建议测试环境使用）"`
+	WebDAVUser     string   `arg:"--webdav-user,env:NAS_WEBDAV_USER" help:"WebDAV 用户名；也可写在目标地址中"`
+	WebDAVPass     string   `arg:"--webdav-pass,env:NAS_WEBDAV_PASS" help:"WebDAV 密码，建议使用环境变量 NAS_WEBDAV_PASS"`
+	WebDAVAskPass  bool     `arg:"--webdav-ask-pass" help:"交互式输入 WebDAV 密码（不回显）"`
+	WebDAVInsecure bool     `arg:"--webdav-insecure" help:"跳过 WebDAV HTTPS 证书校验（不安全，仅建议测试环境使用）"`
 	S3Endpoint     string   `arg:"--s3-endpoint,env:NAS_S3_ENDPOINT" help:"S3 endpoint，如 http://192.168.1.5:3900；留空使用 AWS 默认端点"`
 	S3Region       string   `arg:"--s3-region,env:NAS_S3_REGION" default:"us-east-1" help:"S3 区域，Garage 常用 garage"`
 	S3AccessKey    string   `arg:"--s3-access-key,env:NAS_S3_ACCESS_KEY" help:"S3 Access Key ID"`
@@ -69,7 +73,7 @@ type cliArgs struct {
 }
 
 func (cliArgs) Description() string {
-	return "NASArchiveSync - 把 zip/7z/rar 归档通过 SMB、SFTP、S3 或本地文件夹复制/上传，SHA256 双向校验后在目标和本地各写一份记录，再删除本地压缩包。"
+	return "NASArchiveSync - 把 zip/7z/rar 归档通过 SMB、SFTP、S3、WebDAV 或本地文件夹复制/上传，SHA256 双向校验后在目标和本地各写一份记录，再删除本地压缩包。"
 }
 
 func (cliArgs) Version() string {
@@ -130,6 +134,13 @@ func (cliArgs) Epilogue() string {
 
   # 指定 SFTP 加密算法；auto 会优先使用实测最快的算法
   NASArchiveSync -s "C:\game" -t "sftp://user@192.168.12.1/mnt/hdd1/game" --sftp-cipher chacha20-poly1305@openssh.com
+
+  # WebDAV（OpenList/AList 的 WebDAV 地址通常带 /dav）
+  $env:NAS_WEBDAV_PASS = "password"
+  NASArchiveSync -s "C:\game" -t "webdav://user@192.168.12.1:5200/dav/game" --depth 1
+
+  # https:// 和 webdavs:// 走 HTTPS；自签名证书可加 --webdav-insecure
+  NASArchiveSync -s "C:\game" -t "https://user@nas.example.com/dav/game" --webdav-insecure
 
   # S3 路径模式（IP/localhost endpoint 推荐）
   $env:NAS_S3_ACCESS_KEY = "access-key"
@@ -261,6 +272,22 @@ func run() int {
 		sftpPassword = string(pw)
 	}
 
+	webdavPassword := args.WebDAVPass
+	if args.WebDAVAskPass && !args.List && targetScheme == "webdav" {
+		if !console.IsTerminal(os.Stdin) {
+			logger.Errorf("当前环境无法交互输入密码，请改用 --webdav-pass 或 NAS_WEBDAV_PASS")
+			return 2
+		}
+		fmt.Fprint(os.Stderr, "WebDAV 密码: ")
+		pw, err := term.ReadPassword(int(os.Stdin.Fd()))
+		fmt.Fprintln(os.Stderr)
+		if err != nil {
+			logger.Errorf("读取 WebDAV 密码失败: %v", err)
+			return 2
+		}
+		webdavPassword = string(pw)
+	}
+
 	exts := args.Exts
 	if len(exts) == 0 {
 		exts = []string{"zip", "7z", "rar"}
@@ -301,6 +328,11 @@ func run() int {
 			Cipher:         args.SFTPCipher,
 			KnownHostsPath: args.SFTPKnown,
 			Insecure:       args.SFTPInsecure,
+		},
+		WebDAV: app.WebDAVOptions{
+			User:     args.WebDAVUser,
+			Password: webdavPassword,
+			Insecure: args.WebDAVInsecure,
 		},
 		S3: app.S3Options{
 			Endpoint:     args.S3Endpoint,

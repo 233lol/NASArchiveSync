@@ -3,7 +3,7 @@
 #
 # Usage:
 #   ./build.sh                          # build for the current OS/architecture
-#   ./build.sh --version 0.7.1          # inject a version number
+#   ./build.sh --version 0.8.0          # inject a version number
 #   ./build.sh -o dist/NASArchiveSync-arm64
 #   GOOS=linux GOARCH=arm64 ./build.sh  # cross compile
 #
@@ -12,7 +12,7 @@
 
 set -eu
 
-version="0.7.1"
+version="0.8.0"
 output=""
 go_os="${GOOS:-}"
 go_arch="${GOARCH:-}"
@@ -22,7 +22,7 @@ usage() {
 用法: ./build.sh [选项]
 
 选项:
-  -v, --version VER   注入的版本号（默认 0.7.1）
+  -v, --version VER   注入的版本号（默认 0.8.0）
   -o, --output PATH   输出路径（默认 dist/NASArchiveSync，
                       GOOS=windows 时为 dist/NASArchiveSync.exe）
       --goos OS       目标操作系统，默认使用 go env GOOS
@@ -35,7 +35,7 @@ usage() {
 
 示例:
   ./build.sh
-  ./build.sh --version 0.7.1 -o dist/NASArchiveSync-linux-amd64
+  ./build.sh --version 0.8.0 -o dist/NASArchiveSync-linux-amd64
   GOOS=linux GOARCH=arm64 ./build.sh
 EOF
 }

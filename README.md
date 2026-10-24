@@ -1,6 +1,6 @@
 # NASArchiveSync
 
-把本地 `zip` / `7z` / `rar` 归档通过 SMB、SFTP、S3 对象存储或本地文件夹复制/上传，
+把本地 `zip` / `7z` / `rar` 归档通过 SMB、SFTP、S3 对象存储、WebDAV 或本地文件夹复制/上传，
 读回文件做 SHA256 双向校验，写入 `原名.txt` 上传记录，确认无误后再删除本地压缩包。
 
 ## 功能
@@ -12,10 +12,12 @@
 - 支持 SFTP（含 `sftp://`、`scp://` 和 `user@host:/path` 写法），可用私钥或密码认证，默认校验 known_hosts
 - 目标也可以是本地文件夹（`C:\backup`、`local:C:\backup`、`file:///C:/backup`），同样做 SHA256 校验、写记录、删源
 - 支持 S3 兼容对象存储（Garage、MinIO、Ceph RGW、AWS S3），可选路径模式或虚拟主机/域名模式
+- 支持 WebDAV（`webdav://`、`webdavs://`、`dav://`、`davs://`，也接受 `http://`/`https://`），支持 Basic 认证，兼容 OpenList/AList、Nextcloud、Apache mod_dav 等
+- WebDAV 校验同样支持 Range 并发读取；服务器忽略 Range 时可用 `--verify-concurrency 1` 顺序校验
 - SFTP 可选加密算法，默认 `aes128-gcm@openssh.com`（实测与 AES-256-GCM 并列最快且 CPU 更低），也可用 `--sftp-cipher` 指定
 - 上传时顺带计算本地 SHA256（`io.TeeReader`），新文件只读一遍本地磁盘
 - 上传后从 NAS 读回文件重新计算 SHA256，与本地比对
-- S3 校验默认用 4 路 Range 并发读取（`--verify-concurrency`），哈希仍严格按字节顺序计算，结果与顺序读取完全一致
+- S3/WebDAV 校验默认用 4 路 Range 并发读取（`--verify-concurrency`），哈希仍严格按字节顺序计算，结果与顺序读取完全一致
 - 可选用 `--no-verify` 完全关闭校验：不计算 SHA256、上传后不读回远端，记录标记为未校验
 - 校验一致后按 `--txt` 写入 `压缩包名.txt`（如 `z.7z.txt`）：默认 NAS 与本地各一份，也可只留一边或完全不生成
 - 记录写入成功后才删除本地压缩包；本地 txt 记录会保留，任何失败都保留本地文件
@@ -27,7 +29,7 @@
 - 进度显示百分比、已传/总大小、实时速度、ETA；按终端宽度和中文显示宽度自适应，不会因长文件名换行
 - 幂等：重复运行时已上传且校验一致的文件自动跳过
 - 先写临时文件再重命名，避免产生半截文件
-- 存储层抽象，当前支持 SMB、SFTP、S3 与本地目录，方便后续扩展 FTP/NFS
+- 存储层抽象，当前支持 SMB、SFTP、S3、WebDAV 与本地目录，方便后续扩展 FTP/NFS
 
 ## 工作流程
 
@@ -42,8 +44,8 @@
 ```
 
 默认流水线模式下，第 N 个文件上传完成后立即开始上传第 N+1 个文件，同时由另一个
-连接（SMB/SFTP/S3 或本地目标）校验第 N 个文件；校验仍然是完整的 SHA256 读回，不做采样或只比大小。
-S3 目标还会把读回拆成多个 Range 请求并发下载，再由主协程按顺序喂给 SHA256。
+连接（SMB/SFTP/S3/WebDAV 或本地目标）校验第 N 个文件；校验仍然是完整的 SHA256 读回，不做采样或只比大小。
+S3 和 WebDAV 目标还会把读回拆成多个 Range 请求并发下载，再由主协程按顺序喂给 SHA256。
 
 加 `--no-verify` 时会跳过“上传时哈希”和“读回校验”两步：文件上传成功后直接写记录
 （记录中注明未校验），然后按记录写入结果删除本地压缩包。此模式不启用流水线。
@@ -56,7 +58,7 @@ Windows：
 
 ```powershell
 go build -o dist\NASArchiveSync.exe .
-.\build.ps1 -Version 0.7.1
+.\build.ps1 -Version 0.8.0
 ```
 
 Linux / macOS：
@@ -64,7 +66,7 @@ Linux / macOS：
 ```bash
 go build -o dist/NASArchiveSync .
 ./build.sh                      # 生成 dist/NASArchiveSync
-./build.sh --version 0.7.1      # 注入版本号
+./build.sh --version 0.8.0      # 注入版本号
 ./build.sh -o dist/NASArchiveSync-arm64 --goarch arm64
 GOOS=linux GOARCH=arm64 ./build.sh   # 交叉编译
 ```
@@ -121,6 +123,9 @@ C:\game\a\z.7z.txt          # 本地记录保留
 | `user@192.168.12.1:/mnt/hdd1/game` | scp 简写，路径必须是绝对路径 |
 | `192.168.12.1:/mnt/hdd1/game` | 省略用户名，默认使用当前系统用户 |
 | `s3://oss/game` | S3 bucket `oss`，key 前缀 `game`；endpoint 用 `--s3-endpoint` 指定 |
+| `webdav://user@host:5200/dav/game` | WebDAV（HTTP），路径按服务器 URL 路径解释 |
+| `webdavs://user@host/dav/game` | WebDAV（HTTPS） |
+| `https://user@host/dav/game` | 同样按 WebDAV 处理，等价于 `webdavs://` |
 | `Z:\game` | 系统已映射的网络驱动器，直接当本地路径使用 |
 | `local:C:\test` | 本地目录，用于测试或本地归档 |
 | `file:///C:/test` | 本地目录的 file URL 写法 |
@@ -264,6 +269,53 @@ go test -c -o dist\sftpbench.test.exe .\internal\storage\sftp
 > 注意：Windows 防火墙可能拦截 `%TEMP%` 下的测试二进制，直接运行 `go test` 时若出现
 > `dial tcp ... i/o timeout`，请像上面那样先把测试二进制编译到 `dist\` 再运行。
 
+## WebDAV 上传
+
+WebDAV 目标写成 `webdav://user@host:port/path`，HTTPS 用 `webdavs://` 或直接写
+`https://`。`http://` 和 `https://` 地址也会按 WebDAV 处理。
+
+```powershell
+# 用户名密码写在 URL 中
+.\NASArchiveSync.exe -s "C:\game" -t "webdav://user:password@192.168.12.1:5200/dav/game" --depth 1
+
+# 或通过参数 / 环境变量提供（URL 中的凭据优先）
+$env:NAS_WEBDAV_USER = "user"
+$env:NAS_WEBDAV_PASS = "password"
+.\NASArchiveSync.exe -s "C:\game" -t "webdav://192.168.12.1:5200/dav/game" --depth 1
+
+# 交互输入密码
+.\NASArchiveSync.exe -s "C:\game" -t "webdav://user@192.168.12.1:5200/dav/game" --webdav-ask-pass
+
+# HTTPS（自签名证书测试环境可加 --webdav-insecure）
+.\NASArchiveSync.exe -s "C:\game" -t "https://user@nas.example.com/dav/game" --webdav-insecure
+```
+
+注意 OpenList/AList 的 WebDAV 地址不是网页首页。以测试环境
+`http://192.168.1.5:5200/` 为例，实际 WebDAV 根目录是
+`http://192.168.1.5:5200/dav/`，因此目标应写成：
+
+```powershell
+.\NASArchiveSync.exe -s "C:\game" -t "webdav://192.168.1.5:5200/dav/game" --depth 1
+```
+
+### 认证
+
+- `--webdav-user` / `--webdav-pass`，或环境变量 `NAS_WEBDAV_USER` / `NAS_WEBDAV_PASS`
+- 也可以写成 `webdav://user:pass@host/path`；URL 中的用户名和密码优先于参数
+- `--webdav-ask-pass` 交互输入密码，不回显
+- HTTPS 自签名证书可用 `--webdav-insecure` 跳过证书校验（仅测试环境）
+
+### 行为说明
+
+- 远端目录用 WebDAV `MKCOL` 逐级创建；OpenList 的 `/dav` 会返回 307 到 `/dav/`，客户端会自动跟随
+- 上传先写 `<文件名>.nassync.tmp`，完成后用 `MOVE` 重命名；服务器不支持 `MOVE` 时自动退回
+  `COPY` + `DELETE`，文件不会经过客户端第二次传输
+- 上传采用流式 PUT，不会把整个归档读进内存；如果大小已知会发送 `Content-Length`
+- 32 MiB 以上的文件默认按 16 MiB 一个 Range 请求、4 路并发读回校验（`--verify-concurrency`），
+  哈希仍由主协程按偏移顺序计算，结果与顺序读取完全一致
+- 如果服务器忽略 `Range`，并行校验会明确报错；此时改用 `--verify-concurrency 1` 顺序校验即可
+- 记录 txt 同样写入 WebDAV，例如 `game/a.zip.txt`
+
 ## S3 对象存储
 
 目标写成 `s3://bucket/key前缀`，endpoint、区域和凭据通过参数或环境变量提供：
@@ -345,7 +397,7 @@ $env:NAS_S3_SECRET_KEY = "你的 Secret Access Key"
 | 参数 | 说明 |
 |---|---|
 | `-s, --source DIR` | 源目录，默认当前目录 |
-| `-t, --target ADDR` | 必填，目标（UNC / smb:// / sftp:// / scp:// / host:/path / s3://bucket/prefix / 本地路径 / local: / file://） |
+| `-t, --target ADDR` | 必填，目标（UNC / smb:// / sftp:// / scp:// / host:/path / s3://bucket/prefix / webdav:// / webdavs:// / http(s):// / 本地路径 / local: / file://） |
 | `--depth N` | 最大目录层数：`0` 仅源目录本身（默认），`-1` 不限，`1` 含一级子目录 |
 | `--with-source-dir` | 在目标目录下创建与源目录同名的文件夹后再上传 |
 | `-i, --include GLOB` | 只处理匹配的目录/文件，可重复指定 |
@@ -358,7 +410,7 @@ $env:NAS_S3_SECRET_KEY = "你的 Secret Access Key"
 | `--keep-source` | 上传成功后保留本地压缩包 |
 | `--force` | 目标已存在且内容不一致时覆盖 |
 | `--recheck` | 跳过已上传文件时重新读回远端校验 SHA256 |
-| `--verify-concurrency N` | 远端校验的并发读连接数，默认 `4`，`1` 表示顺序读取；后端支持 Range 时生效（S3 支持），范围为 1-16 |
+| `--verify-concurrency N` | 远端校验的并发读连接数，默认 `4`，`1` 表示顺序读取；后端支持 Range 时生效（S3、WebDAV），范围为 1-16 |
 | `--case-sensitive` | 包含/排除模式区分大小写（默认不区分） |
 | `--smb-user NAME` | SMB 用户名，留空为匿名；支持 `DOMAIN\user` 写法 |
 | `--smb-pass PASS` | SMB 密码（建议使用环境变量） |
@@ -375,6 +427,10 @@ $env:NAS_S3_SECRET_KEY = "你的 Secret Access Key"
 | `--sftp-cipher NAME` | SFTP 加密算法，默认 `auto`（优先 `aes128-gcm@openssh.com`） |
 | `--sftp-known-hosts PATH` | known_hosts 路径，默认 `~/.ssh/known_hosts` |
 | `--sftp-insecure` | 跳过 SFTP 主机密钥校验（不安全，仅建议测试环境） |
+| `--webdav-user NAME` | WebDAV 用户名；也可写在目标地址中 |
+| `--webdav-pass PASS` | WebDAV 密码（建议使用环境变量 `NAS_WEBDAV_PASS`） |
+| `--webdav-ask-pass` | 交互式输入 WebDAV 密码，不回显 |
+| `--webdav-insecure` | 跳过 WebDAV HTTPS 证书校验（不安全，仅测试环境） |
 | `--s3-endpoint URL` | S3 endpoint，如 `http://192.168.1.5:3900`；留空使用 AWS 默认端点 |
 | `--s3-region NAME` | S3 区域，默认 `us-east-1`；Garage 通常填 `garage` |
 | `--s3-access-key ID` | S3 Access Key ID（建议用 `NAS_S3_ACCESS_KEY`） |
@@ -390,8 +446,8 @@ $env:NAS_S3_SECRET_KEY = "你的 Secret Access Key"
 | `--version` | 显示版本 |
 
 环境变量：`NAS_SMB_USER`、`NAS_SMB_PASS`、`NAS_SMB_DOMAIN`、`NAS_SFTP_USER`、`NAS_SFTP_PASS`、
-`NAS_SFTP_KEY`、`NAS_SFTP_KEY_PASS`、`NAS_S3_ENDPOINT`、`NAS_S3_REGION`、`NAS_S3_ACCESS_KEY`、
-`NAS_S3_SECRET_KEY`、`NAS_S3_SESSION_TOKEN`。
+`NAS_SFTP_KEY`、`NAS_SFTP_KEY_PASS`、`NAS_WEBDAV_USER`、`NAS_WEBDAV_PASS`、`NAS_S3_ENDPOINT`、
+`NAS_S3_REGION`、`NAS_S3_ACCESS_KEY`、`NAS_S3_SECRET_KEY`、`NAS_S3_SESSION_TOKEN`。
 
 ## 目录层数
 
@@ -540,7 +596,7 @@ SHA256: 3f2a...e91c
 源路径: C:\game\a\z.7z
 源文件修改时间: 2026-10-20 09:12:31 +08:00
 上传耗时: 28.4s
-工具版本: v0.7.1
+工具版本: v0.8.0
 ```
 
 记录使用 UTF-8 编码。幂等判断依赖 `SHA256` 与 `文件大小(字节)`。
@@ -567,7 +623,7 @@ SHA256: 未计算
 源路径: C:\game\a\z.7z
 源文件修改时间: 2026-10-20 09:12:31 +08:00
 上传耗时: 28.4s
-工具版本: v0.7.1
+工具版本: v0.8.0
 ```
 
 注意：
