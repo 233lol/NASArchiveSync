@@ -31,6 +31,12 @@ type Writer interface {
 	Close() error
 }
 
+// SizedWriter is implemented by backends that can tune their buffering or
+// multipart strategy when the total object size is known.
+type SizedWriter interface {
+	SetSize(size int64)
+}
+
 // Backend abstracts a remote directory tree. All paths are slash separated and
 // relative to the backend root; the empty string refers to the root itself.
 type Backend interface {
@@ -75,6 +81,8 @@ type Options struct {
 	S3SessionToken string
 	S3Style        string // auto, path or virtual
 	S3Insecure     bool
+	S3PartSize     int64 // multipart part size in bytes
+	S3Concurrency  int   // concurrent part uploads
 }
 
 // Target is a parsed --target value.

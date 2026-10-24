@@ -306,7 +306,10 @@ $env:NAS_S3_SECRET_KEY = "secret-key"
 - S3 没有真实目录，`MkdirAll` 是空操作；key 前缀按 `/` 组织，控制台里会以目录形式展示
 - 上传先写 `<key>.nassync.tmp`，再通过 `CopyObject` 复制到正式 key 并删除临时 key
 - 超过 5 GiB 的对象自动使用分片复制（`UploadPartCopy`）
-- 大文件上传按 32 MiB 分片，使用 S3 multipart upload；小文件直接 `PutObject`
+- 大文件上传默认按 16 MiB 分片、8 路并发；小文件直接 `PutObject`
+- 分片大小可用 `--s3-part-size` 调整，并发数可用 `--s3-concurrency` 调整（1-16）
+- 超大文件会自动增大分片，避免超过 S3 的 10000 分片限制
+- HTTP 连接池针对并发分片调优（每主机最多 32 条连接、64 KiB 读写缓冲）
 - 为兼容 Garage/MinIO 等实现，默认不发送非必需的 checksum 头
 - 单文件超过 5 GiB 的正式上传和校验流程与 SMB/SFTP 完全一致，仍然做完整 SHA256 读回
 - 记录 txt 同样以对象形式写入 bucket，例如 `game/a.zip.txt`
@@ -362,6 +365,8 @@ $env:NAS_S3_SECRET_KEY = "你的 Secret Access Key"
 | `--s3-session-token TOKEN` | S3 临时会话令牌（可选） |
 | `--s3-style MODE` | `auto`（默认）/`path`/`virtual`，见“路径模式与域名模式” |
 | `--s3-insecure` | 跳过 S3 HTTPS 证书校验（不安全，仅测试环境） |
+| `--s3-part-size MIB` | S3 分片大小（MiB），默认 `16`，最小 `5` |
+| `--s3-concurrency N` | S3 分片并发上传数，默认 `8`，最大 `16` |
 | `--txt MODE` | 上传记录保存位置：`both`（默认）/`local`/`remote`/`none` |
 | `--no-progress` | 关闭进度条 |
 | `-v, --verbose` | 输出调试日志 |
@@ -518,7 +523,7 @@ SHA256: 3f2a...e91c
 源路径: C:\game\a\z.7z
 源文件修改时间: 2026-10-20 09:12:31 +08:00
 上传耗时: 28.4s
-工具版本: v0.5.0
+工具版本: v0.6.0
 ```
 
 记录使用 UTF-8 编码。幂等判断依赖 `SHA256` 与 `文件大小(字节)`。
@@ -545,7 +550,7 @@ SHA256: 未计算
 源路径: C:\game\a\z.7z
 源文件修改时间: 2026-10-20 09:12:31 +08:00
 上传耗时: 28.4s
-工具版本: v0.5.0
+工具版本: v0.6.0
 ```
 
 注意：
@@ -596,6 +601,17 @@ SHA256: 未计算
 - **实测流水线收益**：同一组 3×512 MiB 文件，顺序模式约 7.7–8.4s，流水线约 7.5s；当校验读取相对上传更慢时收益更明显。流水线不改变校验强度，仍是完整 SHA256 读回。
 - **关闭校验的收益**：`--no-verify` 省掉本地 SHA256 计算和一次完整的远端读回，网络流量减半、耗时最短；代价是无法发现传输或存储损坏。
 - **SFTP 加密与数据包**：默认 `aes128-gcm@openssh.com`，实测上传约 590 MiB/s、读回约 690 MiB/s（25 Gbps 链路）。AES-GCM 约为 ChaCha20 的 1.8 倍、AES-CTR 的 2.8 倍。SFTP 数据包固定 128 KiB，比 32 KiB 约快 15%–50%。详见“SFTP / SCP 上传”章节。
+- **S3 分片并发**：同一 Garage 环境、512 MiB 文件、`--no-verify` 隔离校验耗时的实测结果：
+
+| 上传方式 | 吞吐 |
+|---|---:|
+| 优化前：32 MiB 分片顺序上传 | 29.6 MiB/s |
+| 16 MiB × 4 并发 | 102 MiB/s |
+| **16 MiB × 8 并发（新默认）** | **108 MiB/s** |
+| 8 MiB × 8 并发 | 107 MiB/s |
+| 32 MiB × 8 并发 | 108 MiB/s |
+
+  该测试环境约 1 Gbps，108 MiB/s 已接近实际上限。并发分片把上传阶段的耗时从约 17s 降到约 4.7s；HTTP 连接池也同步做了调优，避免并发请求反复建连。分片/并发可用 `--s3-part-size` 和 `--s3-concurrency` 按网络调整。
 
 ## 扩展其他协议
 
@@ -634,6 +650,21 @@ go vet ./...
 SFTP 相关单元测试覆盖目标地址解析、加密算法选择、known_hosts 损坏行容错和主机密钥重试判断。
 S3 相关单元测试覆盖目标地址解析、auto 模式选择、endpoint 规范化、CopySource 转义，以及
 用本地 httptest 服务器验证 path/virtual 两种请求布局、上传、复制重命名和 Stat。
+
+S3 的真实 multipart 集成测试默认跳过，设置环境变量后运行：
+
+```powershell
+$env:NAS_S3_TEST_ENDPOINT = "http://192.168.1.5:3900"
+$env:NAS_S3_TEST_BUCKET   = "oss"
+$env:NAS_S3_REGION        = "garage"
+$env:NAS_S3_ACCESS_KEY    = "..."
+$env:NAS_S3_SECRET_KEY    = "..."
+go test -race ./internal/storage/s3 -run TestRealMultipart -v
+```
+
+测试会上传 17 MiB（4 个分片）、重命名、读回并删除对象；对象名带时间戳，成功后会自行清理。
+如果 Windows 防火墙拦截 `%TEMP%` 下的测试二进制，可先 `go test -race -c -o dist\s3test.exe ./internal/storage/s3`
+再运行 `dist\s3test.exe "--test.run=TestRealMultipart" "--test.v"`。
 
 真实链路的加密算法吞吐测试见“SFTP / SCP 上传”章节，默认跳过，不会在普通 `go test` 中访问网络。
 

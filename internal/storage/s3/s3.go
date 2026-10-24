@@ -15,7 +15,9 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -30,20 +32,27 @@ import (
 )
 
 const (
-	defaultRegion   = "us-east-1"
-	defaultTimeout  = 30 * time.Second
-	partSize        = 32 << 20   // 32 MiB, above the 5 MiB S3 minimum
-	copyPartSize    = 1024 << 20 // 1 GiB per UploadPartCopy
-	copyObjectLimit = 5 << 30    // CopyObject is limited to 5 GiB
+	defaultRegion      = "us-east-1"
+	defaultTimeout     = 30 * time.Second
+	defaultPartSize    = 16 << 20 // 16 MiB, above the 5 MiB S3 minimum
+	minPartSize        = 5 << 20
+	maxPartSize        = 512 << 20
+	defaultConcurrency = 8
+	maxConcurrency     = 16
+	maxParts           = 9000       // S3 allows 10000; keep headroom
+	copyPartSize       = 1024 << 20 // 1 GiB per UploadPartCopy
+	copyObjectLimit    = 5 << 30    // CopyObject is limited to 5 GiB
 )
 
 // Backend stores objects under bucket/prefix.
 type Backend struct {
-	client     *awss3.Client
-	httpClient *http.Client
-	bucket     string
-	prefix     string
-	style      string
+	client      *awss3.Client
+	httpClient  *http.Client
+	bucket      string
+	prefix      string
+	style       string
+	partSize    int
+	concurrency int
 }
 
 // Open connects to the S3 endpoint and verifies that the bucket is reachable.
@@ -72,6 +81,23 @@ func openWithHTTPClient(t storage.Target, opt storage.Options, httpClient *http.
 	if region == "" {
 		region = defaultRegion
 	}
+	partSize := int(opt.S3PartSize)
+	if partSize <= 0 {
+		partSize = defaultPartSize
+	}
+	if partSize < minPartSize {
+		partSize = minPartSize
+	}
+	if partSize > maxPartSize {
+		partSize = maxPartSize
+	}
+	concurrency := opt.S3Concurrency
+	if concurrency <= 0 {
+		concurrency = defaultConcurrency
+	}
+	if concurrency > maxConcurrency {
+		concurrency = maxConcurrency
+	}
 	accessKey := strings.TrimSpace(opt.S3AccessKey)
 	secretKey := opt.S3SecretKey
 	if (accessKey == "") != (secretKey == "") {
@@ -86,14 +112,10 @@ func openWithHTTPClient(t storage.Target, opt storage.Options, httpClient *http.
 			credentials.NewStaticCredentialsProvider(accessKey, secretKey, opt.S3SessionToken),
 		))
 	}
-	if httpClient == nil && opt.S3Insecure {
-		tr := http.DefaultTransport.(*http.Transport).Clone()
-		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // explicit opt-in
-		httpClient = &http.Client{Transport: tr}
+	if httpClient == nil {
+		httpClient = newHTTPClient(opt.S3Insecure, maxConcurrency*2)
 	}
-	if httpClient != nil {
-		loadOpts = append(loadOpts, awsconfig.WithHTTPClient(httpClient))
-	}
+	loadOpts = append(loadOpts, awsconfig.WithHTTPClient(httpClient))
 
 	cfg, err := awsconfig.LoadDefaultConfig(context.Background(), loadOpts...)
 	if err != nil {
@@ -129,11 +151,13 @@ func openWithHTTPClient(t storage.Target, opt storage.Options, httpClient *http.
 		idleCloser = c
 	}
 	return &Backend{
-		client:     client,
-		httpClient: idleCloser,
-		bucket:     t.Bucket,
-		prefix:     cleanPrefix(t.Path),
-		style:      style,
+		client:      client,
+		httpClient:  idleCloser,
+		bucket:      t.Bucket,
+		prefix:      cleanPrefix(t.Path),
+		style:       style,
+		partSize:    partSize,
+		concurrency: concurrency,
 	}, nil
 }
 
@@ -157,6 +181,30 @@ func normalizeEndpoint(raw string) (string, error) {
 	}
 	u.Path = strings.TrimRight(u.Path, "/")
 	return u.String(), nil
+}
+
+func newHTTPClient(insecure bool, maxConns int) *http.Client {
+	var tr *http.Transport
+	if base, ok := http.DefaultTransport.(*http.Transport); ok {
+		tr = base.Clone()
+	} else {
+		tr = &http.Transport{Proxy: http.ProxyFromEnvironment}
+	}
+	if maxConns < 8 {
+		maxConns = 8
+	}
+	tr.MaxIdleConns = maxConns * 2
+	tr.MaxIdleConnsPerHost = maxConns
+	tr.MaxConnsPerHost = maxConns
+	tr.IdleConnTimeout = 90 * time.Second
+	tr.TLSHandshakeTimeout = 10 * time.Second
+	tr.ExpectContinueTimeout = time.Second
+	tr.WriteBufferSize = 64 << 10
+	tr.ReadBufferSize = 64 << 10
+	if insecure {
+		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // explicit opt-in
+	}
+	return &http.Client{Transport: tr}
 }
 
 func resolveStyle(requested, endpoint string) (string, error) {
@@ -306,14 +354,7 @@ func (b *Backend) Create(rel string) (storage.Writer, error) {
 	if key == "" {
 		return nil, errors.New("拒绝写入 bucket 根对象")
 	}
-	return &writer{
-		client: b.client,
-		bucket: b.bucket,
-		key:    key,
-		// Records are only a few hundred bytes, so start small and let the
-		// buffer grow to partSize for real archives.
-		buf: make([]byte, 0, 64*1024),
-	}, nil
+	return newWriter(b.client, b.bucket, key, b.partSize, b.concurrency), nil
 }
 
 func (b *Backend) Remove(rel string) error {
@@ -502,34 +543,98 @@ func isNotFound(err error) bool {
 }
 
 type writer struct {
-	client     *awss3.Client
-	bucket     string
-	key        string
-	buf        []byte
+	client      *awss3.Client
+	bucket      string
+	key         string
+	partSize    int
+	concurrency int
+
+	buf []byte
+
+	// uploadID, parts and firstErr are guarded by mu. partNumber is only
+	// touched by the goroutine calling Write/Close.
 	uploadID   string
 	parts      []s3types.CompletedPart
 	partNumber int32
 	closed     bool
-	err        error
+	started    bool
+	mu         sync.Mutex
+	firstErr   error
+
+	sem       chan struct{}
+	free      chan []byte
+	wg        sync.WaitGroup
+	abortOnce sync.Once
+}
+
+func newWriter(client *awss3.Client, bucket, key string, partSize, concurrency int) *writer {
+	if partSize < minPartSize {
+		partSize = minPartSize
+	}
+	if concurrency < 1 {
+		concurrency = defaultConcurrency
+	}
+	return &writer{
+		client:      client,
+		bucket:      bucket,
+		key:         key,
+		partSize:    partSize,
+		concurrency: concurrency,
+		buf:         make([]byte, 0, 64*1024),
+		sem:         make(chan struct{}, concurrency),
+		free:        make(chan []byte, concurrency),
+	}
+}
+
+// SetSize grows the part size for very large objects so the S3 10000-part
+// limit is never reached. It is called before the first Write.
+func (w *writer) SetSize(size int64) {
+	if size <= 0 || w.started {
+		return
+	}
+	part := int64(w.partSize)
+	if size > int64(maxParts)*part {
+		part = (size + int64(maxParts) - 1) / int64(maxParts)
+		const mib = int64(1 << 20)
+		part = ((part + mib - 1) / mib) * mib
+		if part > maxPartSize {
+			part = maxPartSize
+		}
+		w.partSize = int(part)
+		// Very large files need large parts; keep memory bounded by lowering
+		// the number of in-flight buffers instead of allocating gigabytes.
+		limit := w.concurrency
+		switch {
+		case w.partSize >= 256<<20:
+			limit = 2
+		case w.partSize >= 64<<20:
+			limit = 4
+		}
+		if limit < w.concurrency {
+			w.concurrency = limit
+			w.sem = make(chan struct{}, limit)
+			w.free = make(chan []byte, limit)
+		}
+	}
 }
 
 func (w *writer) Write(p []byte) (int, error) {
 	if w.closed {
 		return 0, errors.New("S3 writer 已关闭")
 	}
-	if w.err != nil {
-		return 0, w.err
+	if err := w.currentErr(); err != nil {
+		return 0, err
 	}
+	w.started = true
 
 	total := 0
 	for len(p) > 0 {
-		if len(w.buf) >= partSize {
-			if err := w.flushPart(); err != nil {
-				w.err = err
+		if len(w.buf) >= w.partSize {
+			if err := w.dispatchPart(true); err != nil {
 				return total, err
 			}
 		}
-		space := partSize - len(w.buf)
+		space := w.partSize - len(w.buf)
 		n := len(p)
 		if n > space {
 			n = space
@@ -537,9 +642,8 @@ func (w *writer) Write(p []byte) (int, error) {
 		w.buf = append(w.buf, p[:n]...)
 		total += n
 		p = p[n:]
-		if len(w.buf) >= partSize {
-			if err := w.flushPart(); err != nil {
-				w.err = err
+		if len(w.buf) >= w.partSize {
+			if err := w.dispatchPart(true); err != nil {
 				return total, err
 			}
 		}
@@ -547,16 +651,22 @@ func (w *writer) Write(p []byte) (int, error) {
 	return total, nil
 }
 
-func (w *writer) Sync() error { return w.err }
+func (w *writer) Sync() error {
+	if err := w.currentErr(); err != nil {
+		return err
+	}
+	w.wg.Wait()
+	return w.currentErr()
+}
 
 func (w *writer) Close() error {
 	if w.closed {
-		return w.err
+		return w.currentErr()
 	}
 	w.closed = true
-	if w.err != nil {
+	if err := w.currentErr(); err != nil {
 		w.abort()
-		return w.err
+		return err
 	}
 
 	ctx := context.Background()
@@ -569,79 +679,173 @@ func (w *writer) Close() error {
 			ContentLength: aws.Int64(int64(len(w.buf))),
 		})
 		if err != nil {
-			w.err = err
+			w.setErr(err)
 			return err
 		}
 		return nil
 	}
 
 	if len(w.buf) > 0 {
-		if err := w.flushPart(); err != nil {
-			w.err = err
+		if err := w.dispatchPart(false); err != nil {
 			w.abort()
 			return err
 		}
 	}
+	w.wg.Wait()
+	if err := w.currentErr(); err != nil {
+		w.abort()
+		return err
+	}
+
+	w.mu.Lock()
+	parts := append([]s3types.CompletedPart(nil), w.parts...)
+	uploadID := w.uploadID
+	w.mu.Unlock()
+	sort.Slice(parts, func(i, j int) bool {
+		return aws.ToInt32(parts[i].PartNumber) < aws.ToInt32(parts[j].PartNumber)
+	})
+
 	if _, err := w.client.CompleteMultipartUpload(ctx, &awss3.CompleteMultipartUploadInput{
 		Bucket:   aws.String(w.bucket),
 		Key:      aws.String(w.key),
-		UploadId: aws.String(w.uploadID),
+		UploadId: aws.String(uploadID),
 		MultipartUpload: &s3types.CompletedMultipartUpload{
-			Parts: w.parts,
+			Parts: parts,
 		},
 	}); err != nil {
-		w.err = err
+		w.setErr(err)
 		w.abort()
 		return err
 	}
 	return nil
 }
 
-func (w *writer) flushPart() error {
+// dispatchPart hands the current buffer to a background worker. When refill is
+// true it immediately obtains a fresh buffer so Write can keep reading while
+// the part uploads in parallel.
+func (w *writer) dispatchPart(refill bool) error {
 	if len(w.buf) == 0 {
 		return nil
 	}
-	ctx := context.Background()
+
+	// Backpressure: cap the number of in-flight parts and therefore the
+	// number of full-size buffers held in memory.
+	w.sem <- struct{}{}
+	if err := w.currentErr(); err != nil {
+		<-w.sem
+		return err
+	}
+
+	w.mu.Lock()
 	if w.uploadID == "" {
-		out, err := w.client.CreateMultipartUpload(ctx, &awss3.CreateMultipartUploadInput{
+		out, err := w.client.CreateMultipartUpload(context.Background(), &awss3.CreateMultipartUploadInput{
 			Bucket: aws.String(w.bucket),
 			Key:    aws.String(w.key),
 		})
 		if err != nil {
-			return fmt.Errorf("创建 S3 分片上传任务失败: %w", err)
+			w.mu.Unlock()
+			<-w.sem
+			w.setErr(fmt.Errorf("创建 S3 分片上传任务失败: %w", err))
+			return w.currentErr()
 		}
 		w.uploadID = aws.ToString(out.UploadId)
 	}
-
 	w.partNumber++
-	out, err := w.client.UploadPart(ctx, &awss3.UploadPartInput{
-		Bucket:        aws.String(w.bucket),
-		Key:           aws.String(w.key),
-		UploadId:      aws.String(w.uploadID),
-		PartNumber:    aws.Int32(w.partNumber),
-		Body:          bytes.NewReader(w.buf),
-		ContentLength: aws.Int64(int64(len(w.buf))),
-	})
-	if err != nil {
-		return fmt.Errorf("上传 S3 分片失败（第 %d 片）: %w", w.partNumber, err)
+	partNumber := w.partNumber
+	uploadID := w.uploadID
+	w.wg.Add(1)
+	w.mu.Unlock()
+
+	buf := w.buf
+	if refill {
+		w.buf = w.takeBuffer()
+	} else {
+		w.buf = nil
 	}
-	w.parts = append(w.parts, s3types.CompletedPart{
-		ETag:       out.ETag,
-		PartNumber: aws.Int32(w.partNumber),
-	})
-	w.buf = w.buf[:0]
+
+	go func() {
+		defer w.wg.Done()
+		defer func() {
+			<-w.sem
+			w.putBuffer(buf)
+		}()
+
+		out, err := w.client.UploadPart(context.Background(), &awss3.UploadPartInput{
+			Bucket:        aws.String(w.bucket),
+			Key:           aws.String(w.key),
+			UploadId:      aws.String(uploadID),
+			PartNumber:    aws.Int32(partNumber),
+			Body:          bytes.NewReader(buf),
+			ContentLength: aws.Int64(int64(len(buf))),
+		})
+		if err != nil {
+			w.setErr(fmt.Errorf("上传 S3 分片失败（第 %d 片）: %w", partNumber, err))
+			return
+		}
+		w.mu.Lock()
+		w.parts = append(w.parts, s3types.CompletedPart{
+			ETag:       out.ETag,
+			PartNumber: aws.Int32(partNumber),
+		})
+		w.mu.Unlock()
+	}()
 	return nil
 }
 
-func (w *writer) abort() {
-	if w.uploadID == "" {
+func (w *writer) takeBuffer() []byte {
+	select {
+	case b := <-w.free:
+		if cap(b) < w.partSize {
+			return make([]byte, 0, w.partSize)
+		}
+		return b[:0]
+	default:
+		return make([]byte, 0, w.partSize)
+	}
+}
+
+func (w *writer) putBuffer(b []byte) {
+	if b == nil {
 		return
 	}
-	_, _ = w.client.AbortMultipartUpload(context.Background(), &awss3.AbortMultipartUploadInput{
-		Bucket:   aws.String(w.bucket),
-		Key:      aws.String(w.key),
-		UploadId: aws.String(w.uploadID),
+	select {
+	case w.free <- b[:0]:
+	default:
+	}
+}
+
+func (w *writer) currentErr() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.firstErr
+}
+
+func (w *writer) setErr(err error) {
+	if err == nil {
+		return
+	}
+	w.mu.Lock()
+	if w.firstErr == nil {
+		w.firstErr = err
+	}
+	w.mu.Unlock()
+}
+
+func (w *writer) abort() {
+	w.mu.Lock()
+	uploadID := w.uploadID
+	w.mu.Unlock()
+	if uploadID == "" {
+		return
+	}
+	w.abortOnce.Do(func() {
+		_, _ = w.client.AbortMultipartUpload(context.Background(), &awss3.AbortMultipartUploadInput{
+			Bucket:   aws.String(w.bucket),
+			Key:      aws.String(w.key),
+			UploadId: aws.String(uploadID),
+		})
 	})
 }
 
 var _ storage.Writer = (*writer)(nil)
+var _ storage.SizedWriter = (*writer)(nil)

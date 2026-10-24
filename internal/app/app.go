@@ -61,6 +61,8 @@ type S3Options struct {
 	SessionToken string
 	Style        string
 	Insecure     bool
+	PartSize     int64
+	Concurrency  int
 }
 
 // Options configures a Run.
@@ -338,6 +340,8 @@ func Run(ctx context.Context, o Options) (Result, error) {
 		backendOpts.S3SessionToken = o.S3.SessionToken
 		backendOpts.S3Style = o.S3.Style
 		backendOpts.S3Insecure = o.S3.Insecure
+		backendOpts.S3PartSize = o.S3.PartSize
+		backendOpts.S3Concurrency = o.S3.Concurrency
 		if o.S3.Insecure {
 			log.Warnf("已禁用 S3 HTTPS 证书校验（--s3-insecure），连接可能被中间人攻击")
 		}
@@ -1015,6 +1019,9 @@ func uploadFile(ctx context.Context, backend storage.Backend, localPath, remoteR
 	dst, err := backend.Create(tmpRel)
 	if err != nil {
 		return "", fmt.Errorf("创建远端临时文件失败: %w", err)
+	}
+	if sized, ok := dst.(storage.SizedWriter); ok {
+		sized.SetSize(size)
 	}
 
 	// Hash the bytes while they are copied, so the local file only has to be

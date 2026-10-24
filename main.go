@@ -20,7 +20,7 @@ import (
 
 // version is overridden at build time via
 // -ldflags "-X main.version=x.y.z".
-var version = "0.5.0"
+var version = "0.6.0"
 
 type cliArgs struct {
 	Source         string   `arg:"-s,--source" default:"." help:"源目录，默认为当前目录"`
@@ -60,6 +60,8 @@ type cliArgs struct {
 	S3SessionToken string   `arg:"--s3-session-token,env:NAS_S3_SESSION_TOKEN" help:"S3 临时会话令牌（可选）"`
 	S3Style        string   `arg:"--s3-style" default:"auto" help:"S3 访问方式：auto 自动、path 路径模式、virtual 虚拟主机模式"`
 	S3Insecure     bool     `arg:"--s3-insecure" help:"跳过 S3 HTTPS 证书校验（不安全，仅测试环境使用）"`
+	S3PartSize     int      `arg:"--s3-part-size" default:"16" help:"S3 分片大小（MiB），默认 16，最小 5"`
+	S3Concurrency  int      `arg:"--s3-concurrency" default:"8" help:"S3 分片并发上传数，默认 8，最大 16"`
 	Txt            string   `arg:"--txt" default:"both" help:"上传记录保存位置：both 双方（默认）、local 仅本地、remote 仅远程、none 不生成"`
 	NoProgress     bool     `arg:"--no-progress" help:"关闭进度条"`
 	Verbose        bool     `arg:"-v,--verbose" help:"输出调试日志"`
@@ -197,6 +199,14 @@ func run() int {
 		logger.Errorf("--s3-access-key 和 --s3-secret-key 必须同时提供")
 		return 2
 	}
+	if args.S3PartSize < 5 || args.S3PartSize > 1024 {
+		logger.Errorf("--s3-part-size 必须在 5-1024 MiB 之间")
+		return 2
+	}
+	if args.S3Concurrency < 1 || args.S3Concurrency > 16 {
+		logger.Errorf("--s3-concurrency 必须在 1-16 之间")
+		return 2
+	}
 
 	txtMode, txtErr := app.ParseTxtMode(args.Txt)
 	if txtErr != nil {
@@ -294,6 +304,8 @@ func run() int {
 			SessionToken: args.S3SessionToken,
 			Style:        s3Style,
 			Insecure:     args.S3Insecure,
+			PartSize:     int64(args.S3PartSize) << 20,
+			Concurrency:  args.S3Concurrency,
 		},
 		SMBMode:          smbMode,
 		SMBAuthRequested: args.SMBAskPass || args.SMBUser != "" || args.SMBPass != "" || args.SMBDomain != "",
