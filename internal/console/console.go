@@ -7,18 +7,15 @@ import (
 	"golang.org/x/term"
 )
 
-// IsTerminal reports whether w is attached to a character device, which in
-// practice means a terminal window.
+// IsTerminal reports whether w is attached to a real terminal. Checking the
+// character-device bit is not enough: NUL and some redirected handles are
+// character devices but cannot be used for interactive password input.
 func IsTerminal(w io.Writer) bool {
 	f, ok := w.(*os.File)
 	if !ok {
 		return false
 	}
-	fi, err := f.Stat()
-	if err != nil {
-		return false
-	}
-	return fi.Mode()&os.ModeCharDevice != 0
+	return term.IsTerminal(int(f.Fd()))
 }
 
 // Width returns the terminal width for w, or fallback when it cannot be

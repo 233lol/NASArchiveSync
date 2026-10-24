@@ -8,6 +8,7 @@ import (
 	"github.com/fjf/NASArchiveSync/internal/storage"
 	"github.com/fjf/NASArchiveSync/internal/storage/local"
 	"github.com/fjf/NASArchiveSync/internal/storage/native"
+	"github.com/fjf/NASArchiveSync/internal/storage/sftp"
 	"github.com/fjf/NASArchiveSync/internal/storage/smb"
 )
 
@@ -20,6 +21,8 @@ func Open(t storage.Target, opt storage.Options, nativeAccess bool) (storage.Bac
 			return native.Open(t, opt)
 		}
 		return smb.Open(t, opt)
+	case "sftp":
+		return sftp.Open(t, opt)
 	case "local":
 		return local.Open(t, opt)
 	default:

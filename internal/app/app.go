@@ -40,6 +40,18 @@ type SMBOptions struct {
 	Port     int
 }
 
+// SFTPOptions carries SSH/SFTP credentials and tuning.
+type SFTPOptions struct {
+	User           string
+	Password       string
+	KeyPath        string
+	KeyPassphrase  string
+	Port           int
+	Cipher         string
+	KnownHostsPath string
+	Insecure       bool
+}
+
 // Options configures a Run.
 type Options struct {
 	Source string
@@ -67,6 +79,7 @@ type Options struct {
 	NoVerify      bool
 	CaseSensitive bool
 	SMB           SMBOptions
+	SFTP          SFTPOptions
 	// SMBMode is "auto" (default), "native" or "builtin". Native means the
 	// operating system's SMB redirector is used and existing Windows
 	// credentials are reused.
@@ -210,6 +223,11 @@ func Run(ctx context.Context, o Options) (Result, error) {
 			return res, err
 		}
 
+		// A user name in an SMB URL means the built-in client should be used,
+		// just like an explicit --smb-user.
+		if target.Scheme == "smb" && target.User != "" {
+			o.SMBAuthRequested = true
+		}
 		nativeAccess, err = useNativeSMB(target, o)
 		if err != nil {
 			return res, err
@@ -277,6 +295,29 @@ func Run(ctx context.Context, o Options) (Result, error) {
 		Domain:     o.SMB.Domain,
 		Port:       o.SMB.Port,
 		CreateRoot: !o.DryRun,
+	}
+	switch target.Scheme {
+	case "smb":
+		// A user name in the target URL is a convenient fallback for the
+		// built-in client; explicit --smb-user still wins.
+		if backendOpts.User == "" {
+			backendOpts.User = target.User
+		}
+		if backendOpts.Password == "" {
+			backendOpts.Password = target.Password
+		}
+	case "sftp":
+		backendOpts.User = o.SFTP.User
+		backendOpts.Password = o.SFTP.Password
+		backendOpts.Port = o.SFTP.Port
+		backendOpts.KeyPath = o.SFTP.KeyPath
+		backendOpts.KeyPassphrase = o.SFTP.KeyPassphrase
+		backendOpts.Cipher = o.SFTP.Cipher
+		backendOpts.KnownHostsPath = o.SFTP.KnownHostsPath
+		backendOpts.InsecureHostKey = o.SFTP.Insecure
+		if o.SFTP.Insecure {
+			log.Warnf("已禁用 SFTP 主机密钥校验（--sftp-insecure），连接可能被中间人攻击")
+		}
 	}
 	uploadBackend, err := backends.Open(target, backendOpts, nativeAccess)
 	if err != nil {
@@ -956,11 +997,15 @@ func uploadFile(ctx context.Context, backend storage.Backend, localPath, remoteR
 	// Hash the bytes while they are copied, so the local file only has to be
 	// read once for a new upload. --no-verify skips hashing entirely.
 	h := sha256.New()
-	reader := io.Reader(progress.NewReader(ctxReader{ctx: ctx, r: src}, sink))
+	var reader io.Reader = progress.NewReader(ctxReader{ctx: ctx, r: src}, sink)
 	if computeHash {
 		reader = io.TeeReader(reader, h)
 	}
-	written, copyErr := io.CopyBuffer(dst, reader, make([]byte, bufferSizeFor(size)))
+	// The SFTP client pipelines writes only when it can tell how many bytes are
+	// coming. A LimitedReader also guards against a source that grew after it
+	// was stat'ed.
+	limited := &io.LimitedReader{R: reader, N: size}
+	written, copyErr := io.CopyBuffer(dst, limited, make([]byte, bufferSizeFor(size)))
 	if copyErr == nil && written != size {
 		copyErr = fmt.Errorf("写入字节数不符: 已写入 %d，期望 %d", written, size)
 	}

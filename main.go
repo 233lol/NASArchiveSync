@@ -13,12 +13,14 @@ import (
 
 	"github.com/fjf/NASArchiveSync/internal/app"
 	"github.com/fjf/NASArchiveSync/internal/console"
+	"github.com/fjf/NASArchiveSync/internal/storage"
+	"github.com/fjf/NASArchiveSync/internal/storage/sftp"
 	"github.com/fjf/NASArchiveSync/internal/xlog"
 )
 
 // version is overridden at build time via
 // -ldflags "-X main.version=x.y.z".
-var version = "0.3.0"
+var version = "0.4.0"
 
 type cliArgs struct {
 	Source        string   `arg:"-s,--source" default:"." help:"源目录，默认为当前目录"`
@@ -42,13 +44,22 @@ type cliArgs struct {
 	SMBDomain     string   `arg:"--smb-domain" env:"NAS_SMB_DOMAIN" help:"SMB 域/工作组"`
 	SMBPort       int      `arg:"--smb-port" default:"445" help:"SMB 端口，默认 445（内置客户端使用）"`
 	SMBMode       string   `arg:"--smb-mode" default:"auto" help:"SMB 访问方式：auto 无凭据时复用系统访问；native 系统 UNC/映射盘；builtin 内置 SMB 客户端"`
+	SFTPUser      string   `arg:"--sftp-user" env:"NAS_SFTP_USER" help:"SFTP 用户名，默认使用当前系统用户"`
+	SFTPPass      string   `arg:"--sftp-pass" env:"NAS_SFTP_PASS" help:"SFTP 密码，建议使用环境变量 NAS_SFTP_PASS"`
+	SFTPAskPass   bool     `arg:"--sftp-ask-pass" help:"交互式输入 SFTP 密码（不回显）"`
+	SFTPKey       string   `arg:"--sftp-key" env:"NAS_SFTP_KEY" help:"SFTP 私钥路径，默认自动尝试 ~/.ssh/id_ed25519、id_ecdsa、id_rsa"`
+	SFTPKeyPass   string   `arg:"--sftp-key-pass" env:"NAS_SFTP_KEY_PASS" help:"SFTP 私钥口令"`
+	SFTPPort      int      `arg:"--sftp-port" default:"22" help:"SFTP 端口，默认 22"`
+	SFTPCipher    string   `arg:"--sftp-cipher" default:"auto" help:"SFTP 加密算法：auto（默认，自动选择最快）、aes128-gcm@openssh.com、aes256-gcm@openssh.com、chacha20-poly1305@openssh.com、aes128-ctr、aes192-ctr、aes256-ctr"`
+	SFTPKnown     string   `arg:"--sftp-known-hosts" help:"known_hosts 路径，默认 ~/.ssh/known_hosts"`
+	SFTPInsecure  bool     `arg:"--sftp-insecure" help:"跳过 SFTP 主机密钥校验（不安全，仅建议测试环境使用）"`
 	Txt           string   `arg:"--txt" default:"both" help:"上传记录保存位置：both 双方（默认）、local 仅本地、remote 仅远程、none 不生成"`
 	NoProgress    bool     `arg:"--no-progress" help:"关闭进度条"`
 	Verbose       bool     `arg:"-v,--verbose" help:"输出调试日志"`
 }
 
 func (cliArgs) Description() string {
-	return "NASArchiveSync - 把 zip/7z/rar 归档通过 SMB 上传到 NAS，SHA256 双向校验后在 NAS 和本地各写一份记录，再删除本地压缩包。"
+	return "NASArchiveSync - 把 zip/7z/rar 归档通过 SMB 或 SFTP 上传到 NAS，SHA256 双向校验后在 NAS 和本地各写一份记录，再删除本地压缩包。"
 }
 
 func (cliArgs) Version() string {
@@ -95,6 +106,15 @@ func (cliArgs) Epilogue() string {
   # 关闭校验：不计算 SHA256、不读回远端，记录标记为未校验
   NASArchiveSync -s "C:\game" -t "\\192.168.12.1\mnt\hdd1\game" --depth 1 --no-verify
 
+  # 通过 SFTP 上传（默认使用 ~/.ssh 下的私钥，known_hosts 校验主机）
+  NASArchiveSync -s "C:\game" -t "sftp://user@192.168.12.1/mnt/hdd1/game" --depth 1
+
+  # scp 风格地址（host:/path），同样使用 SFTP 子系统
+  NASArchiveSync -s "C:\game" -t "192.168.12.1:/mnt/hdd1/game" --depth 1
+
+  # 指定 SFTP 加密算法；auto 会优先使用实测最快的算法
+  NASArchiveSync -s "C:\game" -t "sftp://user@192.168.12.1/mnt/hdd1/game" --sftp-cipher chacha20-poly1305@openssh.com
+
 匹配模式:
   * 匹配任意字符，? 匹配单个字符，** 匹配多级目录，{a,b} 匹配多选一。
   不含 / 的模式匹配任意层级的目录名或文件名，例如 --exclude temp。
@@ -124,6 +144,14 @@ func run() int {
 		logger.Errorf("--smb-port 必须在 1-65535 之间")
 		return 2
 	}
+	if args.SFTPPort <= 0 || args.SFTPPort > 65535 {
+		logger.Errorf("--sftp-port 必须在 1-65535 之间")
+		return 2
+	}
+	if !validSFTPCipher(args.SFTPCipher) {
+		logger.Errorf("--sftp-cipher 不支持 %q（可选: auto、%s）", args.SFTPCipher, strings.Join(sftp.SupportedCiphers, "、"))
+		return 2
+	}
 	if args.NoVerify && args.Recheck {
 		logger.Errorf("--recheck 需要读取远端并计算 SHA256，不能与 --no-verify 同时使用")
 		return 2
@@ -143,8 +171,18 @@ func run() int {
 		return 2
 	}
 
+	targetScheme := ""
+	if !args.List {
+		parsed, parseErr := storage.ParseTarget(args.Target)
+		if parseErr != nil {
+			logger.Errorf("%v", parseErr)
+			return 2
+		}
+		targetScheme = parsed.Scheme
+	}
+
 	password := args.SMBPass
-	if args.SMBAskPass && !args.List && smbMode != "native" {
+	if args.SMBAskPass && !args.List && targetScheme == "smb" && smbMode != "native" {
 		if !console.IsTerminal(os.Stdin) {
 			logger.Errorf("当前环境无法交互输入密码，请改用 --smb-pass 或 NAS_SMB_PASS")
 			return 2
@@ -157,6 +195,22 @@ func run() int {
 			return 2
 		}
 		password = string(pw)
+	}
+
+	sftpPassword := args.SFTPPass
+	if args.SFTPAskPass && !args.List && targetScheme == "sftp" {
+		if !console.IsTerminal(os.Stdin) {
+			logger.Errorf("当前环境无法交互输入密码，请改用 --sftp-pass 或 NAS_SFTP_PASS")
+			return 2
+		}
+		fmt.Fprint(os.Stderr, "SFTP 密码: ")
+		pw, err := term.ReadPassword(int(os.Stdin.Fd()))
+		fmt.Fprintln(os.Stderr)
+		if err != nil {
+			logger.Errorf("读取 SFTP 密码失败: %v", err)
+			return 2
+		}
+		sftpPassword = string(pw)
 	}
 
 	exts := args.Exts
@@ -189,6 +243,16 @@ func run() int {
 			Domain:   args.SMBDomain,
 			Port:     args.SMBPort,
 		},
+		SFTP: app.SFTPOptions{
+			User:           args.SFTPUser,
+			Password:       sftpPassword,
+			KeyPath:        args.SFTPKey,
+			KeyPassphrase:  args.SFTPKeyPass,
+			Port:           args.SFTPPort,
+			Cipher:         args.SFTPCipher,
+			KnownHostsPath: args.SFTPKnown,
+			Insecure:       args.SFTPInsecure,
+		},
 		SMBMode:          smbMode,
 		SMBAuthRequested: args.SMBAskPass || args.SMBUser != "" || args.SMBPass != "" || args.SMBDomain != "",
 		Txt:              txtMode,
@@ -218,4 +282,17 @@ func run() int {
 		return 1
 	}
 	return 0
+}
+
+func validSFTPCipher(name string) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	if name == "" || name == "auto" {
+		return true
+	}
+	for _, c := range sftp.SupportedCiphers {
+		if c == name {
+			return true
+		}
+	}
+	return false
 }

@@ -6,6 +6,7 @@ func TestParseTarget(t *testing.T) {
 	tests := []struct {
 		raw     string
 		scheme  string
+		user    string
 		host    string
 		share   string
 		path    string
@@ -17,11 +18,21 @@ func TestParseTarget(t *testing.T) {
 		{raw: `\\nas\share`, scheme: "smb", host: "nas", share: "share"},
 		{raw: `smb://nas/mnt/hdd1/game`, scheme: "smb", host: "nas", share: "mnt", path: "hdd1/game"},
 		{raw: `smb://nas:1445/mnt`, scheme: "smb", host: "nas", share: "mnt", port: 1445},
+		{raw: `sftp://fjf@192.168.12.1/mnt/hdd1/game`, scheme: "sftp", user: "fjf", host: "192.168.12.1", path: "/mnt/hdd1/game"},
+		{raw: `sftp://192.168.12.1:2222/mnt/game`, scheme: "sftp", host: "192.168.12.1", path: "/mnt/game", port: 2222},
+		{raw: `scp://root@nas/mnt/game`, scheme: "sftp", user: "root", host: "nas", path: "/mnt/game"},
+		{raw: `192.168.12.1:/mnt/hdd1/game`, scheme: "sftp", host: "192.168.12.1", path: "/mnt/hdd1/game"},
+		{raw: `user@nas:/mnt/game`, scheme: "sftp", user: "user", host: "nas", path: "/mnt/game"},
+		{raw: `nas:/mnt/game`, scheme: "sftp", host: "nas", path: "/mnt/game"},
 		{raw: `local:C:\game`, scheme: "local", path: `C:\game`},
 		{raw: `C:\game`, scheme: "local", path: `C:\game`},
+		{raw: `C:/game`, scheme: "local", path: `C:/game`},
 		{raw: `local:///mnt/game`, scheme: "local", path: "/mnt/game"},
 		{raw: `\\nas`, wantErr: true},
 		{raw: `smb://nas`, wantErr: true},
+		{raw: `sftp://`, wantErr: true},
+		{raw: `sftp:foo`, wantErr: true},
+		{raw: `smb:foo`, wantErr: true},
 		{raw: `ftp://nas/game`, wantErr: true},
 		{raw: ``, wantErr: true},
 	}
@@ -38,7 +49,7 @@ func TestParseTarget(t *testing.T) {
 			t.Errorf("%q: %v", tc.raw, err)
 			continue
 		}
-		if got.Scheme != tc.scheme || got.Host != tc.host || got.Share != tc.share || got.Path != tc.path || got.Port != tc.port {
+		if got.Scheme != tc.scheme || got.User != tc.user || got.Host != tc.host || got.Share != tc.share || got.Path != tc.path || got.Port != tc.port {
 			t.Errorf("%q: got %+v", tc.raw, got)
 		}
 	}

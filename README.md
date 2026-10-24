@@ -1,7 +1,7 @@
 # NASArchiveSync
 
-把本地 `zip` / `7z` / `rar` 归档通过 SMB 上传到 NAS，读回文件做 SHA256 双向校验，写入
-`原名.txt` 上传记录，确认无误后再删除本地压缩包。
+把本地 `zip` / `7z` / `rar` 归档通过 SMB 或 SFTP 上传到 NAS，读回文件做 SHA256 双向校验，
+写入 `原名.txt` 上传记录，确认无误后再删除本地压缩包。
 
 ## 功能
 
@@ -9,6 +9,8 @@
 - 保持相对目录结构，远端目录不存在时自动创建
 - 可选用 `--with-source-dir` 在目标下额外创建与源目录同名的文件夹
 - 支持复用系统已添加的 SMB 路径：Windows 下可直接使用 UNC 路径或映射网络驱动器，沿用已登录凭据，无需在工具中填写密码
+- 支持 SFTP（含 `sftp://`、`scp://` 和 `user@host:/path` 写法），可用私钥或密码认证，默认校验 known_hosts
+- SFTP 可选加密算法，默认 `aes128-gcm@openssh.com`（实测与 AES-256-GCM 并列最快且 CPU 更低），也可用 `--sftp-cipher` 指定
 - 上传时顺带计算本地 SHA256（`io.TeeReader`），新文件只读一遍本地磁盘
 - 上传后从 NAS 读回文件重新计算 SHA256，与本地比对
 - 可选用 `--no-verify` 完全关闭校验：不计算 SHA256、上传后不读回远端，记录标记为未校验
@@ -17,12 +19,12 @@
 - 目录层数限制、包含/排除模式
 - `--dry-run` 演练
 - `--list` 只列出匹配到的归档文件，可省略目标路径，适合检查 include/exclude 规则
-- 默认开启上传/校验流水线：上传下一个文件的同时，用独立 SMB 会话校验上一个文件（`--no-pipeline` 可关闭）
+- 默认开启上传/校验流水线：上传下一个文件的同时，用独立 SMB/SFTP 会话校验上一个文件（`--no-pipeline` 可关闭）
 - 流水线模式显示两行动态进度（上传 / 校验），日志自动让位，不会打乱进度区域；终端不支持 ANSI 时自动退回普通日志
 - 进度显示百分比、已传/总大小、实时速度、ETA；按终端宽度和中文显示宽度自适应，不会因长文件名换行
 - 幂等：重复运行时已上传且校验一致的文件自动跳过
 - 先写临时文件再重命名，避免产生半截文件
-- 存储层抽象，当前支持 SMB 与本地目录，方便后续扩展 FTP/SFTP/NFS
+- 存储层抽象，当前支持 SMB、SFTP 与本地目录，方便后续扩展 FTP/NFS
 
 ## 工作流程
 
@@ -37,7 +39,7 @@
 ```
 
 默认流水线模式下，第 N 个文件上传完成后立即开始上传第 N+1 个文件，同时由另一个
-SMB 会话校验第 N 个文件；校验仍然是完整的 SHA256 读回，不做采样或只比大小。
+SMB/SFTP 会话校验第 N 个文件；校验仍然是完整的 SHA256 读回，不做采样或只比大小。
 
 加 `--no-verify` 时会跳过“上传时哈希”和“读回校验”两步：文件上传成功后直接写记录
 （记录中注明未校验），然后按记录写入结果删除本地压缩包。此模式不启用流水线。
@@ -99,6 +101,11 @@ C:\game\a\z.7z.txt          # 本地记录保留
 | `//192.168.12.1/mnt/hdd1/game` | 同上，正斜杠 |
 | `smb://192.168.12.1/mnt/hdd1/game` | SMB URL，默认同样复用系统凭据 |
 | `smb://192.168.12.1:1445/mnt/hdd1/game` | 指定端口（内置客户端） |
+| `sftp://user@192.168.12.1/mnt/hdd1/game` | SFTP URL，默认 22 端口 |
+| `sftp://user@192.168.12.1:2222/mnt/hdd1/game` | SFTP 指定端口 |
+| `scp://user@192.168.12.1/mnt/hdd1/game` | scp 写法，实际使用 SFTP 子系统 |
+| `user@192.168.12.1:/mnt/hdd1/game` | scp 简写，路径必须是绝对路径 |
+| `192.168.12.1:/mnt/hdd1/game` | 省略用户名，默认使用当前系统用户 |
 | `Z:\game` | 系统已映射的网络驱动器，直接当本地路径使用 |
 | `local:C:\test` | 本地目录，用于测试或本地归档 |
 | `C:\test` | 同上 |
@@ -123,12 +130,105 @@ Windows 里已经能通过资源管理器打开、或已映射为网络驱动器
 
 系统访问的前提是该路径在当前 Windows 用户下已经可读写。启动日志会显示 `(smb-native)` 表示走了系统访问。
 
+## SFTP / SCP 上传
+
+SFTP 与 SMB 共用同一套扫描、上传、SHA256 校验、记录和删源流程，只是把存储层换成 SSH。
+`scp://` 和 `user@host:/path` 写法也走 SFTP 子系统（现代 OpenSSH 的 scp 本身也是这样实现的）。
+
+### 认证
+
+```powershell
+# 默认自动尝试 ~/.ssh/id_ed25519、id_ecdsa、id_rsa
+.\NASArchiveSync.exe -s "C:\game" -t "user@192.168.12.1:/mnt/hdd1/game" --depth 1
+
+# 指定私钥
+.\NASArchiveSync.exe -s "C:\game" -t "sftp://user@192.168.12.1/mnt/hdd1/game" --sftp-key "C:\keys\id_ed25519"
+
+# 私钥有口令
+$env:NAS_SFTP_KEY_PASS = "key-passphrase"
+.\NASArchiveSync.exe -s "C:\game" -t "user@192.168.12.1:/mnt/hdd1/game" --depth 1
+
+# 密码认证（推荐用环境变量或交互输入）
+$env:NAS_SFTP_PASS = "password"
+.\NASArchiveSync.exe -s "C:\game" -t "user@192.168.12.1:/mnt/hdd1/game" --depth 1
+
+# 交互输入密码
+.\NASArchiveSync.exe -s "C:\game" -t "user@192.168.12.1:/mnt/hdd1/game" --sftp-ask-pass
+```
+
+没有提供 `--sftp-user` 时默认使用当前 Windows 用户名；也可以把用户名写在目标地址里
+（`user@host:/path` 或 `sftp://user@host/path`）。
+
+### 主机密钥校验
+
+默认读取 `~/.ssh/known_hosts` 并严格校验服务器主机密钥：
+
+- 主机不在 known_hosts 中：连接失败，提示先添加主机密钥
+- 主机密钥与记录不一致：连接失败（防止中间人攻击）
+- 可用 `--sftp-known-hosts PATH` 指定其他 known_hosts
+- 测试环境可用 `--sftp-insecure` 跳过校验（会打印警告，不建议用于生产）
+
+known_hosts 中个别损坏行会被自动跳过（与 OpenSSH 的行为一致），不会因为一行坏数据导致
+整个文件无法加载。
+
+添加主机密钥：
+
+```powershell
+ssh-keyscan -H 192.168.12.1 >> $env:USERPROFILE\.ssh\known_hosts
+```
+
+### 加密算法
+
+`--sftp-cipher` 可选：
+
+- `auto`（默认）：优先使用 `aes128-gcm@openssh.com`，服务器不支持时按顺序回退
+- `aes128-gcm@openssh.com`
+- `aes256-gcm@openssh.com`
+- `chacha20-poly1305@openssh.com`
+- `aes128-ctr` / `aes192-ctr` / `aes256-ctr`
+
+在 `192.168.12.1`（25 Gbps 链路，NAS 端 `/dev/shm` 内存盘，避免磁盘成为瓶颈）上实测，
+每个算法传输 2 GiB、3 轮取中位数：
+
+| 加密算法 | 上传 MiB/s | 读回 MiB/s |
+|---|---:|---:|
+| `aes128-gcm@openssh.com` | 588 | 694 |
+| `aes256-gcm@openssh.com` | 586 | 709 |
+| `chacha20-poly1305@openssh.com` | 328 | 344 |
+| `aes128-ctr` | 216 | 237 |
+| `aes192-ctr` | 214 | 235 |
+| `aes256-ctr` | 210 | 233 |
+
+AES-GCM 明显快于 ChaCha20 和 AES-CTR。AES-128-GCM 与 AES-256-GCM 在多次长测中互有胜负、
+差距在噪声范围内（4 GiB × 5 轮：AES-128 约 565/690 MiB/s，AES-256 约 591/688 MiB/s），
+因此默认选择 **AES-128-GCM**：吞吐相同、CPU 开销更低，需要更大密钥时改用
+`--sftp-cipher aes256-gcm@openssh.com` 即可。
+
+SFTP 数据包大小固定为 128 KiB（OpenSSH 单条消息上限 256 KiB，留出协议头空间）。
+实测同一链路上 32 KiB 约 500 MiB/s 上传 / 460 MiB/s 读回，128 KiB 提升到约
+590 MiB/s 上传 / 690 MiB/s 读回。
+
+复现实测（需要一台可 SSH 登录的服务器）：
+
+```powershell
+$env:NAS_SFTP_BENCH_HOST = "192.168.12.1"
+$env:NAS_SFTP_BENCH_USER = "root"
+$env:NAS_SFTP_BENCH_DIR = "/dev/shm/nassync-bench"
+$env:NAS_SFTP_BENCH_SIZE = "2147483648"
+$env:NAS_SFTP_BENCH_ROUNDS = "3"
+go test -c -o dist\sftpbench.test.exe .\internal\storage\sftp
+.\dist\sftpbench.test.exe "--test.run=TestCipherThroughput" "--test.v" "--test.timeout=30m"
+```
+
+> 注意：Windows 防火墙可能拦截 `%TEMP%` 下的测试二进制，直接运行 `go test` 时若出现
+> `dial tcp ... i/o timeout`，请像上面那样先把测试二进制编译到 `dist\` 再运行。
+
 ## 命令行参数
 
 | 参数 | 说明 |
 |---|---|
 | `-s, --source DIR` | 源目录，默认当前目录 |
-| `-t, --target ADDR` | 必填，目标目录（UNC / smb:// / local:） |
+| `-t, --target ADDR` | 必填，目标目录（UNC / smb:// / sftp:// / scp:// / host:/path / local:） |
 | `--depth N` | 最大目录层数：`0` 仅源目录本身（默认），`-1` 不限，`1` 含一级子目录 |
 | `--with-source-dir` | 在目标目录下创建与源目录同名的文件夹后再上传 |
 | `-i, --include GLOB` | 只处理匹配的目录/文件，可重复指定 |
@@ -148,12 +248,22 @@ Windows 里已经能通过资源管理器打开、或已映射为网络驱动器
 | `--smb-domain DOMAIN` | SMB 域/工作组 |
 | `--smb-port PORT` | SMB 端口，默认 445（内置客户端使用） |
 | `--smb-mode MODE` | `auto`（默认）/`native`/`builtin`，见上文“复用系统已添加的 SMB 路径” |
+| `--sftp-user NAME` | SFTP 用户名，默认当前系统用户；也可写在目标地址里 |
+| `--sftp-pass PASS` | SFTP 密码（建议使用环境变量 `NAS_SFTP_PASS`） |
+| `--sftp-ask-pass` | 交互式输入 SFTP 密码，不回显 |
+| `--sftp-key PATH` | SFTP 私钥路径，默认自动尝试 `~/.ssh/id_ed25519`、`id_ecdsa`、`id_rsa` |
+| `--sftp-key-pass PASS` | SFTP 私钥口令（环境变量 `NAS_SFTP_KEY_PASS`） |
+| `--sftp-port PORT` | SFTP 端口，默认 22 |
+| `--sftp-cipher NAME` | SFTP 加密算法，默认 `auto`（优先 `aes128-gcm@openssh.com`） |
+| `--sftp-known-hosts PATH` | known_hosts 路径，默认 `~/.ssh/known_hosts` |
+| `--sftp-insecure` | 跳过 SFTP 主机密钥校验（不安全，仅建议测试环境） |
 | `--txt MODE` | 上传记录保存位置：`both`（默认）/`local`/`remote`/`none` |
 | `--no-progress` | 关闭进度条 |
 | `-v, --verbose` | 输出调试日志 |
 | `--version` | 显示版本 |
 
-环境变量：`NAS_SMB_USER`、`NAS_SMB_PASS`、`NAS_SMB_DOMAIN`。
+环境变量：`NAS_SMB_USER`、`NAS_SMB_PASS`、`NAS_SMB_DOMAIN`、`NAS_SFTP_USER`、`NAS_SFTP_PASS`、
+`NAS_SFTP_KEY`、`NAS_SFTP_KEY_PASS`。
 
 ## 目录层数
 
@@ -302,7 +412,7 @@ SHA256: 3f2a...e91c
 源路径: C:\game\a\z.7z
 源文件修改时间: 2026-10-20 09:12:31 +08:00
 上传耗时: 28.4s
-工具版本: v0.3.0
+工具版本: v0.4.0
 ```
 
 记录使用 UTF-8 编码。幂等判断依赖 `SHA256` 与 `文件大小(字节)`。
@@ -329,7 +439,7 @@ SHA256: 未计算
 源路径: C:\game\a\z.7z
 源文件修改时间: 2026-10-20 09:12:31 +08:00
 上传耗时: 28.4s
-工具版本: v0.3.0
+工具版本: v0.4.0
 ```
 
 注意：
@@ -350,7 +460,8 @@ SHA256: 未计算
 
 ## 行为与安全说明
 
-- **流水线（默认）**：上传第 N+1 个文件的同时，用另一个 SMB 会话校验第 N 个文件；两者互不阻塞，适合多个大文件。校验仍是完整读回 + SHA256。加 `--no-pipeline` 可恢复逐文件顺序处理；`--no-verify` 下没有校验步骤，自动按顺序上传。
+- **流水线（默认）**：上传第 N+1 个文件的同时，用另一个 SMB/SFTP 会话校验第 N 个文件；两者互不阻塞，适合多个大文件。校验仍是完整读回 + SHA256。加 `--no-pipeline` 可恢复逐文件顺序处理；`--no-verify` 下没有校验步骤，自动按顺序上传。
+- **SFTP 主机密钥**：默认严格校验 `~/.ssh/known_hosts`；`--sftp-insecure` 会关闭校验并打印警告。密码优先用环境变量或 `--sftp-ask-pass`，避免进入命令历史。
 - **上传即哈希（默认）**：新文件上传时用 `io.TeeReader` 顺带计算本地 SHA256，本地只读一遍；跳过判断、`--recheck` 等场景仍会单独读本地文件。`--no-verify` 下不计算哈希。
 - **关闭校验**：`--no-verify` 不计算 SHA256、不读回远端，记录标记为未校验；成功后仍按记录写入结果删除本地文件，详见“关闭校验”章节。
 - **失败不删源**：上传失败、校验不一致、所需记录写入失败都会保留本地文件。
@@ -371,10 +482,11 @@ SHA256: 未计算
 ## 性能说明
 
 - **本地只读一遍**：新文件在上传时计算 SHA256；旧流程是“先读本地算哈希，再读本地上传”，现在少一次本地全量读取。
-- **流水线重叠**：上传与校验使用两个独立的 SMB 会话，队列长度为 1。上传第 N+1 个文件时，第 N 个文件正在读回校验；校验失败只删除对应远端文件并保留本地文件，其余文件继续处理。
+- **流水线重叠**：上传与校验使用两个独立的 SMB/SFTP 会话，队列长度为 1。上传第 N+1 个文件时，第 N 个文件正在读回校验；校验失败只删除对应远端文件并保留本地文件，其余文件继续处理。
 - **复制缓冲区**：默认 2 MiB（源码中的 `maxCopyBufferSize`）。在 `\\192.168.12.1\mnt\hdd1\game\test` 上用 3 个 512 MiB 文件实测，512 KiB / 1 MiB 约 8.6–8.9s，2 MiB / 4 MiB 约 7.8–8.2s，再往上收益不明显。该值针对大文件；小于缓冲区的文件会按实际大小分配。
 - **实测流水线收益**：同一组 3×512 MiB 文件，顺序模式约 7.7–8.4s，流水线约 7.5s；当校验读取相对上传更慢时收益更明显。流水线不改变校验强度，仍是完整 SHA256 读回。
 - **关闭校验的收益**：`--no-verify` 省掉本地 SHA256 计算和一次完整的远端读回，网络流量减半、耗时最短；代价是无法发现传输或存储损坏。
+- **SFTP 加密与数据包**：默认 `aes128-gcm@openssh.com`，实测上传约 590 MiB/s、读回约 690 MiB/s（25 Gbps 链路）。AES-GCM 约为 ChaCha20 的 1.8 倍、AES-CTR 的 2.8 倍。SFTP 数据包固定 128 KiB，比 32 KiB 约快 15%–50%。详见“SFTP / SCP 上传”章节。
 
 ## 扩展其他协议
 
@@ -397,7 +509,7 @@ type Backend interface {
 
 新增协议只需：
 
-1. 在 `internal/storage/<proto>` 实现 `Backend`（可参考 `local` 与 `smb`）
+1. 在 `internal/storage/<proto>` 实现 `Backend`（可参考 `local`、`smb` 与 `sftp`）
 2. 在 `internal/storage.ParseTarget` 中识别新的地址前缀
 3. 在 `internal/backends/backends.go` 中注册实现
 
@@ -410,6 +522,9 @@ go vet ./...
 
 端到端测试使用 `local:` 后端，覆盖上传、校验、记录、删源、dry-run、层数、幂等、冲突、强制覆盖、远端损坏检测，以及 `--no-verify` 的上传、按记录跳过、冲突和强制覆盖。
 
+SFTP 相关单元测试覆盖目标地址解析、加密算法选择、known_hosts 损坏行容错和主机密钥重试判断。
+真实链路的加密算法吞吐测试见“SFTP / SCP 上传”章节，默认跳过，不会在普通 `go test` 中访问网络。
+
 ## 常见问题
 
 **Q：连接 SMB 失败 / 认证失败？**
@@ -419,7 +534,20 @@ go vet ./...
 内置客户端不支持匿名，请使用 `guest` 账号、提供用户名密码，或改用系统访问（默认 `--smb-mode auto` 在无凭据时即走系统访问）。
 
 **Q：密码放在命令行安全吗？**
-不建议。优先使用环境变量 `NAS_SMB_PASS` 或 `--smb-ask-pass`，避免密码进入命令历史。
+不建议。优先使用环境变量 `NAS_SMB_PASS` / `NAS_SFTP_PASS` 或 `--smb-ask-pass` / `--sftp-ask-pass`，避免密码进入命令历史。
+
+**Q：SFTP 连接失败 / 认证失败？**
+确认主机、端口、用户名，以及 `~/.ssh/known_hosts` 是否已有该主机密钥。默认自动尝试
+`~/.ssh/id_ed25519`、`id_ecdsa`、`id_rsa`；也可用 `--sftp-key` 指定私钥，或用
+`--sftp-pass` / `NAS_SFTP_PASS` / `--sftp-ask-pass` 使用密码。先用 `--dry-run` 验证连接。
+
+**Q：SFTP 提示 known_hosts 中没有主机密钥或密钥不匹配？**
+先用 `ssh-keyscan -H 192.168.12.1 >> $env:USERPROFILE\.ssh\known_hosts` 添加。测试环境可临时加
+`--sftp-insecure`（会打印警告），不建议长期用于生产。
+
+**Q：SFTP 选哪个加密算法？**
+默认 `auto`，优先 `aes128-gcm@openssh.com`。实测它和 `aes256-gcm@openssh.com` 吞吐基本一致，
+明显快于 ChaCha20 和 AES-CTR。需要更大密钥时用 `--sftp-cipher aes256-gcm@openssh.com`。
 
 **Q：提示目标已存在且没有有效上传记录？**
 说明远端已有同名文件但不是本工具写入的，或 SHA256 与本地不同。确认后可加 `--force`。`--no-verify` 下没有 SHA256，只能比较记录中的大小和修改时间，没有匹配记录时同样需要 `--force`。
