@@ -90,6 +90,17 @@ func TestPauseWriter(t *testing.T) {
 	}
 }
 
+func TestMultiBarFinishWithoutDrawWritesNothing(t *testing.T) {
+	m, out := newTestMulti(
+		NewLine("上传", 100, 120),
+		NewLine("校验", 100, 120),
+	)
+	m.Finish()
+	if got := out.String(); got != "" {
+		t.Errorf("finish without a draw should not write anything, got %q", got)
+	}
+}
+
 func TestNewMultiDisabledForBuffer(t *testing.T) {
 	m := NewMulti(&bytes.Buffer{}, []string{"a", "b"}, []int64{0, 0}, true)
 	if m.Enabled() {

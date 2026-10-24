@@ -160,8 +160,14 @@ func (m *MultiBar) Finish() {
 	if m.finished {
 		return
 	}
+	m.finished = true
+	// Nothing was ever drawn (for example every file failed before its first
+	// progress update); leave the terminal untouched instead of printing two
+	// placeholder lines.
+	if !m.drawn {
+		return
+	}
 	m.paused = false
 	m.drawLocked()
 	fmt.Fprint(m.out, "\n")
-	m.finished = true
 }
