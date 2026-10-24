@@ -30,6 +30,14 @@ func New(out io.Writer, verbose, color bool) *Logger {
 	return &Logger{out: out, verbose: verbose, color: color}
 }
 
+// Output returns the writer used by the logger.
+func (l *Logger) Output() io.Writer { return l.out }
+
+// WithOutput returns a logger with the same settings but a different writer.
+func (l *Logger) WithOutput(out io.Writer) *Logger {
+	return &Logger{out: out, verbose: l.verbose, color: l.color}
+}
+
 func (l *Logger) write(code, tag, format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
 	if l.color {

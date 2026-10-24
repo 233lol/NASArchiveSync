@@ -18,7 +18,7 @@ import (
 
 // version is overridden at build time via
 // -ldflags "-X main.version=x.y.z".
-var version = "0.1.0"
+var version = "0.2.0"
 
 type cliArgs struct {
 	Source        string   `arg:"-s,--source" default:"." help:"源目录，默认为当前目录"`
@@ -30,6 +30,7 @@ type cliArgs struct {
 	Exclude       []string `arg:"-e,--exclude,separate" help:"排除匹配的目录/文件，可重复使用"`
 	Exts          []string `arg:"--ext,separate" help:"归档扩展名，默认 zip,7z,rar，可重复使用"`
 	DryRun        bool     `arg:"--dry-run" help:"演练模式：只打印计划，不上传、不写记录、不删除"`
+	NoPipeline    bool     `arg:"--no-pipeline" help:"关闭上传/校验流水线，改为逐文件顺序处理（默认开启流水线）"`
 	KeepSource    bool     `arg:"--keep-source" help:"上传成功后保留本地压缩包"`
 	Force         bool     `arg:"--force" help:"目标已存在且内容不一致时覆盖"`
 	Recheck       bool     `arg:"--recheck" help:"跳过已上传文件时重新读回远端校验 SHA256"`
@@ -86,6 +87,9 @@ func (cliArgs) Epilogue() string {
 
   # 只列出所有 zip/7z/rar 的相对路径
   NASArchiveSync -s "C:\game" --depth -1 --list
+
+  # 关闭流水线，改为逐文件上传后再校验
+  NASArchiveSync -s "C:\game" -t "\\192.168.12.1\mnt\hdd1\game" --depth 1 --no-pipeline
 
 匹配模式:
   * 匹配任意字符，? 匹配单个字符，** 匹配多级目录，{a,b} 匹配多选一。
@@ -168,6 +172,7 @@ func run() int {
 		KeepSource:    args.KeepSource,
 		Force:         args.Force,
 		Recheck:       args.Recheck,
+		Pipeline:      !args.NoPipeline,
 		CaseSensitive: args.CaseSensitive,
 		SMB: app.SMBOptions{
 			User:     args.SMBUser,

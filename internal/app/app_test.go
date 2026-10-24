@@ -715,6 +715,97 @@ func TestRunListNeedsNoTarget(t *testing.T) {
 	}
 }
 
+func TestRunPipelineUploadsAndVerifies(t *testing.T) {
+	src := t.TempDir()
+	dst := filepath.Join(t.TempDir(), "target")
+	writeSourceFile(t, src, "a/one.zip", "one")
+	writeSourceFile(t, src, "a/two.7z", "two")
+	writeSourceFile(t, src, "b/three.rar", "three")
+
+	opts := testOptions(src, dst)
+	opts.Pipeline = true
+	opts.Extensions = nil // use the built-in zip/7z/rar default
+
+	res, err := Run(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Uploaded != 3 || res.Failed != 0 {
+		t.Fatalf("result: %+v", res)
+	}
+	if res.UploadTime <= 0 {
+		t.Errorf("upload timing was not recorded: %v", res.UploadTime)
+	}
+	for _, rel := range []string{"a/one.zip", "a/two.7z", "b/three.rar"} {
+		if !exists(filepath.Join(dst, filepath.FromSlash(rel))) {
+			t.Errorf("remote file missing: %s", rel)
+		}
+		if !exists(filepath.Join(dst, filepath.FromSlash(rel)+".txt")) {
+			t.Errorf("remote note missing: %s", rel)
+		}
+		if exists(filepath.Join(src, filepath.FromSlash(rel))) {
+			t.Errorf("source file should be deleted: %s", rel)
+		}
+		if !exists(filepath.Join(src, filepath.FromSlash(rel)+".txt")) {
+			t.Errorf("local note missing: %s", rel)
+		}
+	}
+}
+
+func TestRunPipelineConflictKeepsLocalAndContinues(t *testing.T) {
+	src := t.TempDir()
+	dst := filepath.Join(t.TempDir(), "target")
+	writeSourceFile(t, src, "a.zip", "local-a")
+	writeSourceFile(t, src, "b.zip", "local-b")
+	writeSourceFile(t, dst, "a.zip", "remote-conflict")
+
+	opts := testOptions(src, dst)
+	opts.Pipeline = true
+
+	res, err := Run(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Uploaded != 1 || res.Failed != 1 {
+		t.Fatalf("result: %+v", res)
+	}
+	if !exists(filepath.Join(src, "a.zip")) {
+		t.Error("conflicting source must be kept")
+	}
+	if exists(filepath.Join(src, "b.zip")) {
+		t.Error("successful source should be deleted")
+	}
+	if got := readFile(t, filepath.Join(dst, "b.zip")); got != "local-b" {
+		t.Errorf("b.zip content = %q", got)
+	}
+}
+
+func TestRunPipelineSkipsAlreadyUploaded(t *testing.T) {
+	src := t.TempDir()
+	dst := filepath.Join(t.TempDir(), "target")
+	writeSourceFile(t, src, "a.zip", "a")
+	writeSourceFile(t, src, "b.zip", "b")
+
+	opts := testOptions(src, dst)
+	opts.Pipeline = true
+	opts.KeepSource = true
+	if res, err := Run(context.Background(), opts); err != nil || res.Uploaded != 2 {
+		t.Fatalf("first run: res=%+v err=%v", res, err)
+	}
+
+	opts.KeepSource = false
+	res, err := Run(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+	if res.Skipped != 2 || res.Uploaded != 0 || res.Failed != 0 {
+		t.Fatalf("second run result: %+v", res)
+	}
+	if exists(filepath.Join(src, "a.zip")) || exists(filepath.Join(src, "b.zip")) {
+		t.Error("sources should be deleted after a verified skip")
+	}
+}
+
 func TestRunHandlesEmptyArchive(t *testing.T) {
 	src := t.TempDir()
 	dst := filepath.Join(t.TempDir(), "target")
