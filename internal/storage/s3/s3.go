@@ -53,6 +53,9 @@ type Backend struct {
 	style       string
 	partSize    int
 	concurrency int
+	// pool is shared by every writer from this backend. Uploads run one at a
+	// time, so reusing part buffers here keeps memory flat across files.
+	pool *bufferPool
 }
 
 // Open connects to the S3 endpoint and verifies that the bucket is reachable.
@@ -150,6 +153,12 @@ func openWithHTTPClient(t storage.Target, opt storage.Options, httpClient *http.
 	if c, ok := cfg.HTTPClient.(*http.Client); ok {
 		idleCloser = c
 	}
+	// A shared pool only pays off when another file will reuse the buffers;
+	// for a single file the per-writer pool is released sooner.
+	var pool *bufferPool
+	if opt.ReuseBuffers {
+		pool = newBufferPool(concurrency+1, partSize)
+	}
 	return &Backend{
 		client:      client,
 		httpClient:  idleCloser,
@@ -158,6 +167,7 @@ func openWithHTTPClient(t storage.Target, opt storage.Options, httpClient *http.
 		style:       style,
 		partSize:    partSize,
 		concurrency: concurrency,
+		pool:        pool,
 	}, nil
 }
 
@@ -388,7 +398,7 @@ func (b *Backend) Create(rel string) (storage.Writer, error) {
 	if key == "" {
 		return nil, errors.New("拒绝写入 bucket 根对象")
 	}
-	return newWriter(b.client, b.bucket, key, b.partSize, b.concurrency), nil
+	return newWriter(b.client, b.bucket, key, b.partSize, b.concurrency, b.pool), nil
 }
 
 func (b *Backend) Remove(rel string) error {
@@ -596,17 +606,20 @@ type writer struct {
 	firstErr   error
 
 	sem       chan struct{}
-	free      chan []byte
+	pool      *bufferPool
 	wg        sync.WaitGroup
 	abortOnce sync.Once
 }
 
-func newWriter(client *awss3.Client, bucket, key string, partSize, concurrency int) *writer {
+func newWriter(client *awss3.Client, bucket, key string, partSize, concurrency int, pool *bufferPool) *writer {
 	if partSize < minPartSize {
 		partSize = minPartSize
 	}
 	if concurrency < 1 {
 		concurrency = defaultConcurrency
+	}
+	if pool == nil {
+		pool = newBufferPool(concurrency+1, partSize)
 	}
 	return &writer{
 		client:      client,
@@ -616,7 +629,7 @@ func newWriter(client *awss3.Client, bucket, key string, partSize, concurrency i
 		concurrency: concurrency,
 		buf:         make([]byte, 0, 64*1024),
 		sem:         make(chan struct{}, concurrency),
-		free:        make(chan []byte, concurrency),
+		pool:        pool,
 	}
 }
 
@@ -647,7 +660,6 @@ func (w *writer) SetSize(size int64) {
 		if limit < w.concurrency {
 			w.concurrency = limit
 			w.sem = make(chan struct{}, limit)
-			w.free = make(chan []byte, limit)
 		}
 	}
 }
@@ -660,6 +672,12 @@ func (w *writer) Write(p []byte) (int, error) {
 		return 0, err
 	}
 	w.started = true
+	// Archives are written in large chunks; start them with a full-size buffer
+	// from the pool so it can be reused by later files. Completion notes are
+	// only a few hundred bytes and keep the small initial buffer.
+	if len(w.buf) == 0 && cap(w.buf) < w.partSize && len(p) >= 1<<20 {
+		w.buf = w.pool.get(w.partSize)
+	}
 
 	total := 0
 	for len(p) > 0 {
@@ -676,7 +694,9 @@ func (w *writer) Write(p []byte) (int, error) {
 		w.buf = append(w.buf, p[:n]...)
 		total += n
 		p = p[n:]
-		if len(w.buf) >= w.partSize {
+		// Leave a full final part for Close so no extra buffer has to be
+		// fetched just to hold nothing.
+		if len(w.buf) >= w.partSize && len(p) > 0 {
 			if err := w.dispatchPart(true); err != nil {
 				return total, err
 			}
@@ -827,25 +847,74 @@ func (w *writer) dispatchPart(refill bool) error {
 }
 
 func (w *writer) takeBuffer() []byte {
-	select {
-	case b := <-w.free:
-		if cap(b) < w.partSize {
-			return make([]byte, 0, w.partSize)
-		}
-		return b[:0]
-	default:
-		return make([]byte, 0, w.partSize)
-	}
+	return w.pool.get(w.partSize)
 }
 
 func (w *writer) putBuffer(b []byte) {
 	if b == nil {
 		return
 	}
-	select {
-	case w.free <- b[:0]:
-	default:
+	w.pool.put(b)
+}
+
+// bufferPool reuses multipart buffers across uploads. Only one file is uploaded
+// at a time per backend, so a shared pool lets the next file reuse the previous
+// file's buffers immediately instead of waiting for the garbage collector.
+type bufferPool struct {
+	mu     sync.Mutex
+	free   [][]byte
+	limit  int
+	minCap int
+	maxCap int
+}
+
+func newBufferPool(limit, partSize int) *bufferPool {
+	if limit < 1 {
+		limit = 1
 	}
+	if partSize < minPartSize {
+		partSize = minPartSize
+	}
+	return &bufferPool{
+		limit:  limit,
+		minCap: minPartSize,
+		maxCap: partSize,
+	}
+}
+
+// get returns an empty buffer with room for at least size bytes, reusing a
+// pooled buffer when one is large enough.
+func (p *bufferPool) get(size int) []byte {
+	for {
+		p.mu.Lock()
+		n := len(p.free)
+		if n == 0 {
+			p.mu.Unlock()
+			return make([]byte, 0, size)
+		}
+		buf := p.free[n-1]
+		p.free = p.free[:n-1]
+		p.mu.Unlock()
+		if cap(buf) >= size {
+			return buf[:0]
+		}
+		// Too small for this file (part size grew): drop it and try again.
+	}
+}
+
+// put stores buf for reuse. Buffers outside the configured part size range are
+// dropped: tiny ones are not useful, and huge ones (created for very large
+// objects) would otherwise pin hundreds of MiB.
+func (p *bufferPool) put(buf []byte) {
+	n := cap(buf)
+	if n < p.minCap || n > p.maxCap {
+		return
+	}
+	p.mu.Lock()
+	if len(p.free) < p.limit {
+		p.free = append(p.free, buf[:0])
+	}
+	p.mu.Unlock()
 }
 
 func (w *writer) currentErr() error {

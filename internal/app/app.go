@@ -113,6 +113,8 @@ type Options struct {
 	// sourcePrefix is the source directory name used when WithSourceDir is set.
 	// It is derived in Run and prefixes every remote relative path.
 	sourcePrefix string
+	// verifyPool reuses range-read buffers across files in one run.
+	verifyPool *chunkPool
 }
 
 // Outcome describes what happened to a single archive.
@@ -306,12 +308,25 @@ func Run(ctx context.Context, o Options) (Result, error) {
 		return res, nil
 	}
 
+	// Only reuse verification buffers when more than one file will be read
+	// back: for a single file the pool would just keep memory alive longer.
+	if len(files) > 1 && o.VerifyConcurrency > 1 {
+		workers := o.VerifyConcurrency
+		if workers > maxVerifyConcurrency {
+			workers = maxVerifyConcurrency
+		}
+		o.verifyPool = newChunkPool(parallelHashChunkSize, workers)
+	}
+
 	backendOpts := storage.Options{
 		User:       o.SMB.User,
 		Password:   o.SMB.Password,
 		Domain:     o.SMB.Domain,
 		Port:       o.SMB.Port,
 		CreateRoot: !o.DryRun,
+		// Several files will reuse the same buffer pool; a single file is
+		// faster to release when the writer is done.
+		ReuseBuffers: len(files) > 1,
 	}
 	switch target.Scheme {
 	case "smb":
@@ -803,7 +818,7 @@ func handleSkip(ctx context.Context, o Options, log *xlog.Logger, backend storag
 		log.Debugf("没有匹配的上传记录，读回远端文件判断是否已上传: %s", st.paths.remotePath)
 		checkCounter := newHash(fc.label("校验已存在", st.file.Rel), st.size)
 		verifyStart := time.Now()
-		remoteSHA, hashErr := hashRemoteFile(ctx, backend, st.paths.remoteRel, checkCounter, st.size, o.VerifyConcurrency)
+		remoteSHA, hashErr := hashRemoteFile(ctx, backend, st.paths.remoteRel, checkCounter, st.size, o.VerifyConcurrency, o.verifyPool)
 		res.verifyTime += time.Since(verifyStart)
 		if hashErr != nil {
 			checkCounter.Abort()
@@ -835,7 +850,7 @@ func handleSkip(ctx context.Context, o Options, log *xlog.Logger, backend storag
 	} else if o.Recheck {
 		checkCounter := newHash(fc.label("重新校验", st.file.Rel), st.size)
 		verifyStart := time.Now()
-		remoteSHA, hashErr := hashRemoteFile(ctx, backend, st.paths.remoteRel, checkCounter, st.size, o.VerifyConcurrency)
+		remoteSHA, hashErr := hashRemoteFile(ctx, backend, st.paths.remoteRel, checkCounter, st.size, o.VerifyConcurrency, o.verifyPool)
 		res.verifyTime += time.Since(verifyStart)
 		if hashErr != nil {
 			checkCounter.Abort()
@@ -913,7 +928,7 @@ func verifyUploaded(ctx context.Context, o Options, log *xlog.Logger, backend st
 
 	counter := newHash(fc.label("校验远端", st.file.Rel), st.size)
 	verifyStart := time.Now()
-	remoteSHA, err := hashRemoteFile(ctx, backend, st.paths.remoteRel, counter, st.size, o.VerifyConcurrency)
+	remoteSHA, err := hashRemoteFile(ctx, backend, st.paths.remoteRel, counter, st.size, o.VerifyConcurrency, o.verifyPool)
 	res.verifyTime = time.Since(verifyStart)
 	if err != nil {
 		counter.Abort()
@@ -1195,9 +1210,9 @@ func hashLocalFile(ctx context.Context, p string, sink progress.Sink, size int64
 	return hashReader(ctx, f, sink, size)
 }
 
-func hashRemoteFile(ctx context.Context, backend storage.Backend, rel string, sink progress.Sink, size int64, concurrency int) (string, error) {
+func hashRemoteFile(ctx context.Context, backend storage.Backend, rel string, sink progress.Sink, size int64, concurrency int, pool *chunkPool) (string, error) {
 	if rr, ok := backend.(storage.RangeReader); ok && concurrency > 1 && size >= parallelHashMinSize {
-		return hashRemoteRanges(ctx, rr, rel, sink, size, concurrency)
+		return hashRemoteRanges(ctx, rr, rel, sink, size, concurrency, pool)
 	}
 	f, err := backend.Open(rel)
 	if err != nil {

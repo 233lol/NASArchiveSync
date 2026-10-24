@@ -74,7 +74,7 @@ func TestPathAndVirtualHostStyles(t *testing.T) {
 			srv := httptest.NewServer(fake)
 			defer srv.Close()
 
-			b := openTestBackend(t, srv, style, "base")
+			b := openTestBackend(t, srv, style, "base", false)
 
 			w, err := b.Create("dir/a.zip")
 			if err != nil {
@@ -140,7 +140,7 @@ func TestPathAndVirtualHostStyles(t *testing.T) {
 	}
 }
 
-func openTestBackend(t *testing.T, srv *httptest.Server, style, prefix string) storage.Backend {
+func openTestBackend(t *testing.T, srv *httptest.Server, style, prefix string, reuse bool) storage.Backend {
 	t.Helper()
 	port := portOf(t, srv.URL)
 	dialer := &net.Dialer{Timeout: 5 * time.Second}
@@ -161,6 +161,8 @@ func openTestBackend(t *testing.T, srv *httptest.Server, style, prefix string) s
 		S3SecretKey: "secret",
 		S3Style:     style,
 		Timeout:     5 * time.Second,
+
+		ReuseBuffers: reuse,
 	}, hc)
 	if err != nil {
 		t.Fatalf("open: %v", err)
@@ -172,7 +174,7 @@ func TestOpenRange(t *testing.T) {
 	fake := newFakeS3()
 	srv := httptest.NewServer(fake)
 	defer srv.Close()
-	b := openTestBackend(t, srv, "path", "base")
+	b := openTestBackend(t, srv, "path", "base", false)
 
 	w, err := b.Create("obj.bin")
 	if err != nil {
@@ -213,6 +215,90 @@ func TestOpenRange(t *testing.T) {
 
 	if _, err := rr.OpenRange("missing.bin", 0, 4); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("missing object error = %v", err)
+	}
+}
+
+func TestBufferPoolReuse(t *testing.T) {
+	p := newBufferPool(2, 16<<20)
+	first := p.get(16 << 20)
+	if cap(first) < 16<<20 {
+		t.Fatalf("cap = %d", cap(first))
+	}
+	first = append(first, 1)
+	p.put(first)
+
+	second := p.get(16 << 20)
+	if &first[0] != &second[:1][0] {
+		t.Error("pool did not reuse the returned buffer")
+	}
+}
+
+func TestBufferPoolDropsUnusableBuffers(t *testing.T) {
+	p := newBufferPool(2, 16<<20)
+	p.put(make([]byte, 0, 1<<20))  // below minCap
+	p.put(make([]byte, 0, 32<<20)) // above maxCap
+	p.mu.Lock()
+	n := len(p.free)
+	p.mu.Unlock()
+	if n != 0 {
+		t.Errorf("pool kept %d unusable buffers", n)
+	}
+	if got := cap(p.get(16 << 20)); got != 16<<20 {
+		t.Errorf("fresh buffer cap = %d", got)
+	}
+}
+
+func TestBufferPoolLimit(t *testing.T) {
+	p := newBufferPool(2, 16<<20)
+	for i := 0; i < 5; i++ {
+		p.put(make([]byte, 0, 16<<20))
+	}
+	p.mu.Lock()
+	n := len(p.free)
+	p.mu.Unlock()
+	if n != 2 {
+		t.Errorf("pool holds %d buffers, want 2", n)
+	}
+}
+
+func TestWritersShareBufferPool(t *testing.T) {
+	fake := newFakeS3()
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+	b := openTestBackend(t, srv, "path", "base", true).(*Backend)
+
+	w1, err := b.Create("a.zip")
+	if err != nil {
+		t.Fatal(err)
+	}
+	w2, err := b.Create("b.zip")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w1.(*writer).pool != b.pool || w2.(*writer).pool != b.pool {
+		t.Error("writers do not share the backend buffer pool")
+	}
+}
+
+func TestWritersGetOwnPoolWithoutReuse(t *testing.T) {
+	fake := newFakeS3()
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+	b := openTestBackend(t, srv, "path", "base", false).(*Backend)
+	if b.pool != nil {
+		t.Error("backend kept a shared pool for a single-file run")
+	}
+
+	w1, err := b.Create("a.zip")
+	if err != nil {
+		t.Fatal(err)
+	}
+	w2, err := b.Create("b.zip")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w1.(*writer).pool == w2.(*writer).pool {
+		t.Error("writers should not share a pool without ReuseBuffers")
 	}
 }
 

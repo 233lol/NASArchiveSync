@@ -39,7 +39,7 @@ func TestHashRemoteRangesMatchesSequential(t *testing.T) {
 	fake := &fakeRangeReader{data: data}
 
 	for _, concurrency := range []int{1, 2, 3, 4, 8} {
-		got, err := hashRemoteRangesChunked(context.Background(), fake, "f.zip", nil, int64(len(data)), concurrency, testHashChunk)
+		got, err := hashRemoteRangesChunked(context.Background(), fake, "f.zip", nil, int64(len(data)), concurrency, testHashChunk, nil)
 		if err != nil {
 			t.Fatalf("concurrency=%d: %v", concurrency, err)
 		}
@@ -52,7 +52,7 @@ func TestHashRemoteRangesMatchesSequential(t *testing.T) {
 func TestHashRemoteRangesDoesNotSkipChunks(t *testing.T) {
 	data := make([]byte, 2*testHashChunk)
 	fake := &fakeRangeReader{data: data}
-	if _, err := hashRemoteRangesChunked(context.Background(), fake, "f.zip", nil, int64(len(data)), 4, testHashChunk); err != nil {
+	if _, err := hashRemoteRangesChunked(context.Background(), fake, "f.zip", nil, int64(len(data)), 4, testHashChunk, nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := fake.calls.Load(); got != 2 {
@@ -63,8 +63,31 @@ func TestHashRemoteRangesDoesNotSkipChunks(t *testing.T) {
 func TestHashRemoteRangesPropagatesError(t *testing.T) {
 	data := make([]byte, 4*testHashChunk)
 	fake := &fakeRangeReader{data: data, fail: testHashChunk}
-	if _, err := hashRemoteRangesChunked(context.Background(), fake, "f.zip", nil, int64(len(data)), 4, testHashChunk); err == nil {
+	if _, err := hashRemoteRangesChunked(context.Background(), fake, "f.zip", nil, int64(len(data)), 4, testHashChunk, nil); err == nil {
 		t.Fatal("expected an error")
+	}
+}
+
+func TestChunkPoolReuse(t *testing.T) {
+	p := newChunkPool(testHashChunk, 2)
+	first := p.get()
+	p.put(first)
+
+	second := p.get()
+	if &first[:1][0] != &second[:1][0] {
+		t.Error("chunk pool did not reuse the returned buffer")
+	}
+}
+
+func TestHashRemoteRangesReturnsBuffers(t *testing.T) {
+	data := make([]byte, 4*testHashChunk)
+	fake := &fakeRangeReader{data: data}
+	p := newChunkPool(testHashChunk, 4)
+	if _, err := hashRemoteRangesChunked(context.Background(), fake, "f.zip", nil, int64(len(data)), 4, testHashChunk, p); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(p.free); got != 4 {
+		t.Errorf("pool holds %d buffers after verification, want 4", got)
 	}
 }
 
@@ -73,7 +96,7 @@ func TestHashRemoteRangesCanceled(t *testing.T) {
 	fake := &fakeRangeReader{data: data}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := hashRemoteRangesChunked(ctx, fake, "f.zip", nil, int64(len(data)), 4, testHashChunk); err == nil {
+	if _, err := hashRemoteRangesChunked(ctx, fake, "f.zip", nil, int64(len(data)), 4, testHashChunk, nil); err == nil {
 		t.Fatal("expected a context error")
 	}
 }

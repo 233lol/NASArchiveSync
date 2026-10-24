@@ -20,7 +20,7 @@ import (
 
 // version is overridden at build time via
 // -ldflags "-X main.version=x.y.z".
-var version = "0.7.0"
+var version = "0.7.1"
 
 type cliArgs struct {
 	Source         string   `arg:"-s,--source" default:"." help:"源目录，默认为当前目录"`

@@ -90,6 +90,9 @@ type Options struct {
 	S3Insecure     bool
 	S3PartSize     int64 // multipart part size in bytes
 	S3Concurrency  int   // concurrent part uploads
+	// ReuseBuffers hints that several files will be written in one run, so a
+	// backend may keep its write buffers warm between files.
+	ReuseBuffers bool
 }
 
 // Target is a parsed --target value.

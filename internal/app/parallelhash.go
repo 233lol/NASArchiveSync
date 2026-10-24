@@ -20,19 +20,67 @@ const (
 	// parallelHashMaxBuffered caps the memory used by in-flight chunks,
 	// regardless of how many workers were requested.
 	parallelHashMaxBuffered = 256 << 20
+	// maxVerifyConcurrency bounds range-read workers and the buffer pool.
+	maxVerifyConcurrency = 16
 )
+
+// chunkPool keeps range-read buffers alive between files. A plain channel is
+// used instead of sync.Pool because sync.Pool is emptied at every garbage
+// collection, which would make each file allocate its buffers again.
+type chunkPool struct {
+	free chan []byte
+	size int
+}
+
+func newChunkPool(size, n int) *chunkPool {
+	if n < 1 {
+		n = 1
+	}
+	return &chunkPool{free: make(chan []byte, n), size: size}
+}
+
+func (p *chunkPool) get() []byte {
+	select {
+	case b := <-p.free:
+		return b[:0]
+	default:
+		return make([]byte, 0, p.size)
+	}
+}
+
+// take removes n buffers from the pool, allocating any that are missing.
+func (p *chunkPool) take(n int) [][]byte {
+	bufs := make([][]byte, n)
+	for i := range bufs {
+		bufs[i] = p.get()
+	}
+	return bufs
+}
+
+func (p *chunkPool) put(b []byte) {
+	if b == nil || cap(b) < p.size {
+		return
+	}
+	select {
+	case p.free <- b[:0]:
+	default:
+	}
+}
 
 // hashRemoteRanges computes the SHA256 of a remote file by fetching fixed-size
 // byte ranges concurrently. Chunks are still hashed strictly in order, so the
 // result is exactly the same as reading the file sequentially.
-func hashRemoteRanges(ctx context.Context, rr storage.RangeReader, rel string, sink progress.Sink, size int64, concurrency int) (string, error) {
-	return hashRemoteRangesChunked(ctx, rr, rel, sink, size, concurrency, parallelHashChunkSize)
+func hashRemoteRanges(ctx context.Context, rr storage.RangeReader, rel string, sink progress.Sink, size int64, concurrency int, pool *chunkPool) (string, error) {
+	return hashRemoteRangesChunked(ctx, rr, rel, sink, size, concurrency, parallelHashChunkSize, pool)
 }
 
-func hashRemoteRangesChunked(ctx context.Context, rr storage.RangeReader, rel string, sink progress.Sink, size int64, concurrency int, chunkSize int64) (string, error) {
+func hashRemoteRangesChunked(ctx context.Context, rr storage.RangeReader, rel string, sink progress.Sink, size int64, concurrency int, chunkSize int64, pool *chunkPool) (string, error) {
 	nChunks := int((size + chunkSize - 1) / chunkSize)
 
 	workers := concurrency
+	if workers > maxVerifyConcurrency {
+		workers = maxVerifyConcurrency
+	}
 	if workers > nChunks {
 		workers = nChunks
 	}
@@ -41,6 +89,18 @@ func hashRemoteRangesChunked(ctx context.Context, rr storage.RangeReader, rel st
 	}
 	if workers < 1 {
 		workers = 1
+	}
+	if pool == nil {
+		pool = newChunkPool(int(chunkSize), workers)
+	}
+
+	// Every worker holds one buffer while it waits for a job, and buffers are
+	// only recycled after their bytes have been hashed. Taking the buffer
+	// first means a worker can never hold a chunk it cannot download, and
+	// limits the verification to exactly `workers` buffers.
+	free := make(chan []byte, workers)
+	for _, b := range pool.take(workers) {
+		free <- b
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -54,10 +114,6 @@ func hashRemoteRangesChunked(ctx context.Context, rr storage.RangeReader, rel st
 
 	jobs := make(chan int, workers)
 	done := make(chan rangeResult, workers)
-	free := make(chan []byte, workers)
-	for i := 0; i < workers; i++ {
-		free <- make([]byte, 0, chunkSize)
-	}
 
 	var wg sync.WaitGroup
 	var firstErr error
@@ -76,18 +132,23 @@ func hashRemoteRangesChunked(ctx context.Context, rr storage.RangeReader, rel st
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for idx := range jobs {
-				start := int64(idx) * chunkSize
-				length := chunkSize
-				if start+length > size {
-					length = size - start
-				}
-
+			for {
 				var buf []byte
 				select {
 				case buf = <-free:
 				case <-ctx.Done():
 					return
+				}
+				idx, ok := <-jobs
+				if !ok {
+					free <- buf
+					return
+				}
+
+				start := int64(idx) * chunkSize
+				length := chunkSize
+				if start+length > size {
+					length = size - start
 				}
 				if int64(cap(buf)) < length {
 					buf = make([]byte, length)
@@ -136,6 +197,7 @@ func hashRemoteRangesChunked(ctx context.Context, rr storage.RangeReader, rel st
 			case <-ctx.Done():
 				cancel()
 				wg.Wait()
+				drainBuffers(free, pool)
 				if firstErr != nil {
 					return "", firstErr
 				}
@@ -150,22 +212,33 @@ func hashRemoteRangesChunked(ctx context.Context, rr storage.RangeReader, rel st
 		if res.err != nil {
 			cancel()
 			wg.Wait()
+			drainBuffers(free, pool)
 			return "", res.err
 		}
 		_, _ = h.Write(res.data)
-		select {
-		case free <- res.data[:0]:
-		default:
-		}
+		free <- res.data[:0]
 		next++
 	}
 
 	cancel()
 	wg.Wait()
+	drainBuffers(free, pool)
 	if firstErr != nil {
 		return "", firstErr
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// drainBuffers returns every free buffer to the shared pool.
+func drainBuffers(free chan []byte, pool *chunkPool) {
+	for {
+		select {
+		case b := <-free:
+			pool.put(b)
+		default:
+			return
+		}
+	}
 }
 
 // readRange fetches one range into buf and reports progress as bytes arrive.
