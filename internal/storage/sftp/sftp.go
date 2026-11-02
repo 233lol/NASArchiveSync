@@ -221,6 +221,11 @@ func cleanRoot(p string) string {
 
 func (b *Backend) Kind() string { return "sftp" }
 
+// RenameReplaces reports that posix-rename@openssh.com atomically replaces the
+// destination. Servers without the extension fail the rename, which keeps the
+// old file intact rather than losing it.
+func (b *Backend) RenameReplaces() bool { return true }
+
 // endpoint renders host[:port] for logs. Port 22 is omitted so the common case
 // stays identical to scp notation.
 func (b *Backend) endpoint() string {

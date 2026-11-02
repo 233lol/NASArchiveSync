@@ -38,3 +38,7 @@ func Open(t storage.Target, opt storage.Options) (storage.Backend, error) {
 }
 
 func (b *Backend) Kind() string { return "smb-native" }
+
+// RenameReplaces follows the local backend semantics. On Windows the system
+// rename does not replace an existing file.
+func (b *Backend) RenameReplaces() bool { return runtime.GOOS != "windows" }

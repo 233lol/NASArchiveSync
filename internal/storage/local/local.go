@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	"github.com/fjf/NASArchiveSync/internal/storage"
 )
@@ -31,6 +32,10 @@ func Open(t storage.Target, opt storage.Options) (storage.Backend, error) {
 }
 
 func (b *Backend) Kind() string { return "local" }
+
+// RenameReplaces reports whether os.Rename replaces an existing destination.
+// Unix does; Windows returns an error instead.
+func (b *Backend) RenameReplaces() bool { return runtime.GOOS != "windows" }
 
 func (b *Backend) Root() string { return b.root }
 

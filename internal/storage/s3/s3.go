@@ -265,6 +265,9 @@ func (b *Backend) Kind() string {
 	return "s3-path"
 }
 
+// RenameReplaces reports that CopyObject overwrites the destination key.
+func (b *Backend) RenameReplaces() bool { return true }
+
 func (b *Backend) Root() string {
 	if b.prefix == "" {
 		return "s3://" + b.bucket

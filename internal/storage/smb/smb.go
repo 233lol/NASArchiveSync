@@ -100,6 +100,10 @@ func Open(t storage.Target, opt storage.Options) (storage.Backend, error) {
 
 func (b *Backend) Kind() string { return "smb" }
 
+// RenameReplaces reports that SMB2 rename does not replace an existing target
+// (ReplaceIfExists is not set by the client library).
+func (b *Backend) RenameReplaces() bool { return false }
+
 func (b *Backend) Root() string {
 	p := `\\` + b.host + `\` + b.shareTo
 	if b.root != "" {

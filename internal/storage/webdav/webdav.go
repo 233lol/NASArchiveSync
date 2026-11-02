@@ -204,6 +204,10 @@ func (b *Backend) Kind() string {
 	return "webdav"
 }
 
+// RenameReplaces reports that MOVE (and the COPY fallback) overwrite the
+// destination.
+func (b *Backend) RenameReplaces() bool { return true }
+
 func (b *Backend) Root() string {
 	return b.displayURL(b.rootPath)
 }

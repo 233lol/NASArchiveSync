@@ -892,6 +892,31 @@ func TestRunNoVerifySkipsMatchingRecord(t *testing.T) {
 	}
 }
 
+func TestRunNoVerifyTxtLocalSkipsSameTarget(t *testing.T) {
+	src := t.TempDir()
+	dst := filepath.Join(t.TempDir(), "target")
+	writeSourceFile(t, src, "a/z.7z", "local")
+
+	opts := testOptions(src, dst)
+	opts.NoVerify = true
+	opts.Txt = TxtLocal
+	opts.KeepSource = true
+	if res, err := Run(context.Background(), opts); err != nil || res.Uploaded != 1 {
+		t.Fatalf("first run: res=%+v err=%v", res, err)
+	}
+
+	res, err := Run(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+	if res.Skipped != 1 || res.Failed != 0 {
+		t.Fatalf("second run result: %+v", res)
+	}
+	if !exists(filepath.Join(src, "a", "z.7z")) {
+		t.Error("--keep-source must keep the archive")
+	}
+}
+
 func TestRunNoVerifyConflictNeedsForce(t *testing.T) {
 	src := t.TempDir()
 	dst := filepath.Join(t.TempDir(), "target")
@@ -1023,6 +1048,158 @@ func TestRunHandlesRarByDefault(t *testing.T) {
 	}
 	if !exists(filepath.Join(src, "a", "old.rar.txt")) {
 		t.Error("local completion note missing")
+	}
+}
+
+func TestRunDoesNotTrustLocalNoteFromAnotherTarget(t *testing.T) {
+	src := t.TempDir()
+	targetA := filepath.Join(t.TempDir(), "target-a")
+	targetB := filepath.Join(t.TempDir(), "target-b")
+	writeSourceFile(t, src, "a/z.7z", "local")
+	writeSourceFile(t, targetB, "a/z.7z", "other") // same size, different content
+
+	optsA := testOptions(src, targetA)
+	optsA.KeepSource = true
+	if res, err := Run(context.Background(), optsA); err != nil || res.Uploaded != 1 {
+		t.Fatalf("first run: res=%+v err=%v", res, err)
+	}
+
+	optsB := testOptions(src, targetB)
+	res, err := Run(context.Background(), optsB)
+	if err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+	if res.Failed != 1 || res.Uploaded != 0 || res.Skipped != 0 {
+		t.Fatalf("second run result: %+v", res)
+	}
+	if !exists(filepath.Join(src, "a", "z.7z")) {
+		t.Error("source must be kept when the local note belongs to another target")
+	}
+	if got := readFile(t, filepath.Join(targetB, "a", "z.7z")); got != "other" {
+		t.Errorf("target B content = %q, want untouched old content", got)
+	}
+	if exists(filepath.Join(targetB, "a", "z.7z.txt")) {
+		t.Error("a conflicting target must not receive a completion note")
+	}
+}
+
+func TestRunNoVerifyDoesNotTrustLocalNoteFromAnotherTarget(t *testing.T) {
+	src := t.TempDir()
+	targetA := filepath.Join(t.TempDir(), "target-a")
+	targetB := filepath.Join(t.TempDir(), "target-b")
+	writeSourceFile(t, src, "a/z.7z", "local")
+	writeSourceFile(t, targetB, "a/z.7z", "other") // same size, different content
+
+	optsA := testOptions(src, targetA)
+	optsA.NoVerify = true
+	optsA.Txt = TxtLocal
+	optsA.KeepSource = true
+	if res, err := Run(context.Background(), optsA); err != nil || res.Uploaded != 1 {
+		t.Fatalf("first run: res=%+v err=%v", res, err)
+	}
+
+	optsB := testOptions(src, targetB)
+	optsB.NoVerify = true
+	optsB.Txt = TxtLocal
+	res, err := Run(context.Background(), optsB)
+	if err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+	if res.Failed != 1 || res.Uploaded != 0 || res.Skipped != 0 {
+		t.Fatalf("second run result: %+v", res)
+	}
+	if !exists(filepath.Join(src, "a", "z.7z")) {
+		t.Error("source must be kept when the local note belongs to another target")
+	}
+	if got := readFile(t, filepath.Join(targetB, "a", "z.7z")); got != "other" {
+		t.Errorf("target B content = %q, want untouched old content", got)
+	}
+}
+
+func TestRunNoVerifyRejectsRemoteSizeMismatch(t *testing.T) {
+	src := t.TempDir()
+	dst := filepath.Join(t.TempDir(), "target")
+	writeSourceFile(t, src, "a/z.7z", "local")
+
+	opts := testOptions(src, dst)
+	opts.NoVerify = true
+	opts.KeepSource = true
+	if res, err := Run(context.Background(), opts); err != nil || res.Uploaded != 1 {
+		t.Fatalf("first run: res=%+v err=%v", res, err)
+	}
+
+	// Keep the matching notes but replace the remote file with a larger one.
+	if err := os.WriteFile(filepath.Join(dst, "a", "z.7z"), []byte("remote-content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	opts.KeepSource = false
+	res, err := Run(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+	if res.Failed != 1 || res.Skipped != 0 {
+		t.Fatalf("second run result: %+v", res)
+	}
+	if !exists(filepath.Join(src, "a", "z.7z")) {
+		t.Error("source must be kept when the remote size differs")
+	}
+	if got := readFile(t, filepath.Join(dst, "a", "z.7z")); got != "remote-content" {
+		t.Errorf("remote content = %q, want untouched", got)
+	}
+}
+
+func TestRunDryRunPlanMatchesNoVerifyAndConflictBehavior(t *testing.T) {
+	src := t.TempDir()
+	dst := filepath.Join(t.TempDir(), "target")
+	writeSourceFile(t, src, "a/z.7z", "local")
+	writeSourceFile(t, dst, "a/z.7z", "other")
+
+	var out bytes.Buffer
+	opts := testOptions(src, dst)
+	opts.DryRun = true
+	opts.NoVerify = true
+	opts.Logger = xlog.New(&out, false, false)
+	if res, err := Run(context.Background(), opts); err != nil || res.Planned != 1 {
+		t.Fatalf("run: res=%+v err=%v", res, err)
+	}
+	plan := out.String()
+	if strings.Contains(plan, "上传后读回校验 SHA256") {
+		t.Errorf("no-verify dry run must not promise a read-back:\n%s", plan)
+	}
+	if !strings.Contains(plan, "不读回校验") {
+		t.Errorf("no-verify dry run should mention skipped verification:\n%s", plan)
+	}
+	if !strings.Contains(plan, "报冲突") {
+		t.Errorf("dry run should report the conflict without a note:\n%s", plan)
+	}
+
+	out.Reset()
+	opts.NoVerify = false
+	opts.Logger = xlog.New(&out, false, false)
+	if res, err := Run(context.Background(), opts); err != nil || res.Planned != 1 {
+		t.Fatalf("verify run: res=%+v err=%v", res, err)
+	}
+	plan = out.String()
+	if strings.Contains(plan, "将校验/覆盖") {
+		t.Errorf("dry run must not claim it will overwrite without --force:\n%s", plan)
+	}
+	if !strings.Contains(plan, "读回远端判断") {
+		t.Errorf("dry run should mention the read-back check:\n%s", plan)
+	}
+}
+
+func TestUniqueTempRelIsUnique(t *testing.T) {
+	seen := make(map[string]struct{})
+	for i := 0; i < 64; i++ {
+		name := uniqueTempRel("a/b.7z")
+		if !strings.HasPrefix(name, "a/b.7z.nassync.") || !strings.HasSuffix(name, ".tmp") {
+			t.Fatalf("unexpected temp name: %q", name)
+		}
+		if _, ok := seen[name]; ok {
+			t.Fatalf("duplicate temp name: %q", name)
+		}
+		seen[name] = struct{}{}
 	}
 }
 

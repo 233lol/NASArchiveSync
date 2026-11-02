@@ -9,6 +9,8 @@ import (
 	"io"
 	"sync/atomic"
 	"testing"
+
+	"github.com/fjf/NASArchiveSync/internal/storage"
 )
 
 const testHashChunk = 1 << 20
@@ -28,6 +30,66 @@ func (f *fakeRangeReader) OpenRange(rel string, offset, length int64) (io.ReadCl
 		return nil, errors.New("bad range")
 	}
 	return io.NopCloser(bytes.NewReader(f.data[offset : offset+length])), nil
+}
+
+type fakeHashBackend struct {
+	fakeRangeReader
+	size int64
+}
+
+func (b *fakeHashBackend) Kind() string               { return "fake" }
+func (b *fakeHashBackend) Root() string               { return "fake" }
+func (b *fakeHashBackend) Location(rel string) string { return rel }
+func (b *fakeHashBackend) MkdirAll(string) error      { return nil }
+func (b *fakeHashBackend) Open(string) (io.ReadCloser, error) {
+	return io.NopCloser(bytes.NewReader(b.data)), nil
+}
+func (b *fakeHashBackend) Stat(rel string) (storage.FileInfo, error) {
+	return storage.FileInfo{Name: rel, Size: b.size}, nil
+}
+func (b *fakeHashBackend) Create(string) (storage.Writer, error) {
+	return nil, errors.New("not implemented")
+}
+func (b *fakeHashBackend) Remove(string) error         { return nil }
+func (b *fakeHashBackend) Rename(string, string) error { return nil }
+func (b *fakeHashBackend) Close() error                { return nil }
+
+func TestHashRemoteFileRejectsLargerRemote(t *testing.T) {
+	size := int64(parallelHashMinSize)
+	data := make([]byte, size+1)
+	backend := &fakeHashBackend{
+		fakeRangeReader: fakeRangeReader{data: data},
+		size:            int64(len(data)),
+	}
+
+	_, err := hashRemoteFile(context.Background(), backend, "f.zip", nil, size, 2, nil)
+	if err == nil {
+		t.Fatal("expected a size mismatch error")
+	}
+	if calls := backend.calls.Load(); calls != 0 {
+		t.Errorf("range reads = %d, want none before the size check", calls)
+	}
+}
+
+func TestHashRemoteFileAcceptsMatchingSize(t *testing.T) {
+	size := int64(parallelHashMinSize)
+	data := make([]byte, size)
+	for i := range data {
+		data[i] = byte(i*17 + 3)
+	}
+	want := sha256.Sum256(data)
+	backend := &fakeHashBackend{
+		fakeRangeReader: fakeRangeReader{data: data},
+		size:            size,
+	}
+
+	got, err := hashRemoteFile(context.Background(), backend, "f.zip", nil, size, 2, nil)
+	if err != nil {
+		t.Fatalf("hashRemoteFile: %v", err)
+	}
+	if got != hex.EncodeToString(want[:]) {
+		t.Errorf("hash = %s, want %s", got, hex.EncodeToString(want[:]))
+	}
 }
 
 func TestHashRemoteRangesMatchesSequential(t *testing.T) {

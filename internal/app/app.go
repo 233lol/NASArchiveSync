@@ -4,6 +4,7 @@ package app
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -668,7 +669,7 @@ func processFile(ctx context.Context, o Options, log *xlog.Logger, backend stora
 	}
 
 	if o.DryRun {
-		if err := planFile(o, log, backend, file, st.size, st.paths.relDir, st.paths.remoteRel, st.remoteExists, plan); err != nil {
+		if err := planFile(o, log, backend, st, plan); err != nil {
 			return fileResult{outcome: OutcomeFailed, file: file.Rel, size: st.size, err: err}
 		}
 		return fileResult{outcome: OutcomePlanned, file: file.Rel, size: st.size}
@@ -685,6 +686,14 @@ func processFile(ctx context.Context, o Options, log *xlog.Logger, backend stora
 		return handleSkip(ctx, o, log, backend, st, fc, newHash, quiet)
 	}
 	return uploadAndVerify(ctx, o, log, backend, st, fc, newHash, newUpload, quiet)
+}
+
+// recordTargetMatches reports whether a completion note belongs to the current
+// target. Local notes live next to the source archive and are shared by every
+// target, so a matching hash alone does not prove that this target already
+// holds the archive.
+func recordTargetMatches(rec *report.Record, targetPath string) bool {
+	return rec != nil && rec.TargetPath != "" && rec.TargetPath == targetPath
 }
 
 // recordMatchesFile reports whether a completion note describes this exact
@@ -704,20 +713,37 @@ func recordMatchesFile(rec *report.Record, size int64, mod time.Time) bool {
 func handleSkipNoVerify(o Options, log *xlog.Logger, backend storage.Backend, st *fileState) fileResult {
 	res := fileResult{file: st.file.Rel, size: st.size}
 
-	remoteMatch := st.recErr == nil && recordMatchesFile(st.rec, st.size, st.info.ModTime())
-	localMatch := st.localRecErr == nil && recordMatchesFile(st.localRec, st.size, st.info.ModTime())
+	remoteMatch := st.recErr == nil && recordTargetMatches(st.rec, st.paths.remotePath) &&
+		recordMatchesFile(st.rec, st.size, st.info.ModTime())
+	localMatch := st.localRecErr == nil && recordTargetMatches(st.localRec, st.paths.remotePath) &&
+		recordMatchesFile(st.localRec, st.size, st.info.ModTime())
+
+	// The note records the local size; the remote file itself must still match
+	// it before a note is trusted. A size mismatch is cheap to detect and
+	// cannot be explained by a valid upload.
+	if st.remoteInfo.Size != st.size {
+		res.outcome = OutcomeFailed
+		res.err = conflictError(st.paths.remotePath, "大小与本地文件不同")
+		return res
+	}
 
 	var content []byte
 	remoteOK, localOK := false, false
 	switch {
 	case remoteMatch:
 		content, remoteOK, localOK = st.recData, true, localMatch
-	case localMatch:
+	case localMatch && os.IsNotExist(st.recErr):
+		// A local note for this exact target is the only evidence available
+		// when the remote side has no note, as with --txt local.
 		content, localOK = st.localRecData, true
 	}
 	if content == nil {
+		reason := "已关闭校验且没有可用的上传记录，无法确认内容是否一致"
+		if st.recErr == nil || localMatch {
+			reason = "已关闭校验且上传记录与当前目标不一致，无法确认内容是否一致"
+		}
 		res.outcome = OutcomeFailed
-		res.err = conflictError(st.paths.remotePath, "已关闭校验且没有可用的上传记录，无法确认内容是否一致")
+		res.err = conflictError(st.paths.remotePath, reason)
 		return res
 	}
 
@@ -811,26 +837,36 @@ func handleSkip(ctx context.Context, o Options, log *xlog.Logger, backend storag
 	hashCounter.Finish()
 	log.Debugf("本地 SHA256: %s", localSHA)
 
-	remoteMatch := st.recErr == nil && st.rec.SHA256 == localSHA && st.rec.Size == st.size
-	localMatch := st.localRecErr == nil && st.localRec.SHA256 == localSHA && st.localRec.Size == st.size
+	remoteMatch := st.recErr == nil && recordTargetMatches(st.rec, st.paths.remotePath) &&
+		st.rec.SHA256 == localSHA && st.rec.Size == st.size
+	localMatch := st.localRecErr == nil && recordTargetMatches(st.localRec, st.paths.remotePath) &&
+		st.localRec.SHA256 == localSHA && st.localRec.Size == st.size
+
+	// A completion note records the source size, but the remote file can still
+	// be truncated or replaced. Check the cheap evidence first.
+	if st.remoteInfo.Size != st.size {
+		res.outcome = OutcomeFailed
+		res.err = conflictError(st.paths.remotePath, "大小与本地文件不同")
+		return res
+	}
 
 	var content []byte
 	remoteOK, localOK := false, false
+	verified := false
 	switch {
 	case remoteMatch:
 		content, remoteOK, localOK = st.recData, true, localMatch
-	case localMatch:
+	case localMatch && os.IsNotExist(st.recErr):
+		// The local note belongs to this exact target and there is no remote
+		// note (for example --txt local), so it is safe to reuse it.
 		content, localOK = st.localRecData, true
 	}
 
 	if content == nil {
-		if st.remoteInfo.Size != st.size {
-			res.outcome = OutcomeFailed
-			res.err = conflictError(st.paths.remotePath, "大小与本地文件不同")
-			return res
-		}
-		// No usable note on either side (for example --txt none): read the
-		// remote file back so a repeated run can still be idempotent.
+		// The remote side has no note, has an unreadable note, or has a note
+		// that contradicts the local file. Read the remote copy back before
+		// trusting either note. This also covers local notes written for a
+		// different target.
 		log.Debugf("没有匹配的上传记录，读回远端文件判断是否已上传: %s", st.paths.remotePath)
 		checkCounter := newHash(fc.label("校验已存在", st.file.Rel), st.size)
 		verifyStart := time.Now()
@@ -843,27 +879,40 @@ func handleSkip(ctx context.Context, o Options, log *xlog.Logger, backend storag
 			return res
 		}
 		checkCounter.Finish()
+		verified = true
 		if remoteSHA != localSHA {
 			res.outcome = OutcomeFailed
 			res.err = conflictError(st.paths.remotePath, "SHA256 与本地文件不同")
 			return res
 		}
-		uploadedAt := st.remoteInfo.ModTime
-		if uploadedAt.IsZero() {
-			uploadedAt = now(o)
+		if localMatch {
+			content, localOK = st.localRecData, true
+		} else {
+			uploadedAt := st.remoteInfo.ModTime
+			if uploadedAt.IsZero() {
+				uploadedAt = now(o)
+			}
+			content = []byte(report.Record{
+				FileName:      filepath.Base(st.file.Path),
+				TargetPath:    st.paths.remotePath,
+				Size:          st.size,
+				SHA256:        localSHA,
+				UploadedAt:    uploadedAt,
+				SourcePath:    st.file.Path,
+				SourceModTime: st.info.ModTime(),
+				ToolVersion:   version(o),
+				Verified:      true,
+			}.Render())
 		}
-		content = []byte(report.Record{
-			FileName:      filepath.Base(st.file.Path),
-			TargetPath:    st.paths.remotePath,
-			Size:          st.size,
-			SHA256:        localSHA,
-			UploadedAt:    uploadedAt,
-			SourcePath:    st.file.Path,
-			SourceModTime: st.info.ModTime(),
-			ToolVersion:   version(o),
-			Verified:      true,
-		}.Render())
-	} else if o.Recheck {
+	}
+
+	if content == nil {
+		res.outcome = OutcomeFailed
+		res.err = conflictError(st.paths.remotePath, "没有可用的上传记录")
+		return res
+	}
+
+	if o.Recheck && !verified {
 		checkCounter := newHash(fc.label("重新校验", st.file.Rel), st.size)
 		verifyStart := time.Now()
 		remoteSHA, hashErr := hashRemoteFile(ctx, backend, st.paths.remoteRel, checkCounter, st.size, o.VerifyConcurrency, o.verifyPool)
@@ -991,7 +1040,31 @@ func verifyUploaded(ctx context.Context, o Options, log *xlog.Logger, backend st
 	return res
 }
 
-func planFile(o Options, log *xlog.Logger, backend storage.Backend, file scan.File, size int64, relDir, remoteRel string, remoteExists bool, plan *planState) error {
+func planFile(o Options, log *xlog.Logger, backend storage.Backend, st *fileState, plan *planState) error {
+	file := st.file
+	relDir := st.paths.relDir
+	remoteRel := st.paths.remoteRel
+	remoteExists := st.remoteExists
+	hasRecord := st.remoteInfo.Size == st.size &&
+		((st.recErr == nil && recordTargetMatches(st.rec, st.paths.remotePath) &&
+			st.rec.Size == st.size) ||
+			(os.IsNotExist(st.recErr) && st.localRecErr == nil &&
+				recordTargetMatches(st.localRec, st.paths.remotePath) && st.localRec.Size == st.size))
+	willUpload := !remoteExists || o.Force
+	willSkip := remoteExists && !o.Force && hasRecord
+	willConflict := false
+	if o.NoVerify && remoteExists && !o.Force {
+		// Without hashes the same size and source mtime decide, so the dry run
+		// can predict the outcome exactly.
+		remoteMatch := st.recErr == nil && recordTargetMatches(st.rec, st.paths.remotePath) &&
+			recordMatchesFile(st.rec, st.size, st.info.ModTime())
+		localMatch := st.localRecErr == nil && recordTargetMatches(st.localRec, st.paths.remotePath) &&
+			recordMatchesFile(st.localRec, st.size, st.info.ModTime())
+		willSkip = st.remoteInfo.Size == st.size &&
+			(remoteMatch || (localMatch && os.IsNotExist(st.recErr)))
+		willConflict = !willSkip
+	}
+
 	if !plan.rootChecked {
 		plan.rootChecked = true
 		_, err := backend.Stat("")
@@ -1017,25 +1090,112 @@ func planFile(o Options, log *xlog.Logger, backend storage.Backend, file scan.Fi
 			log.Infof("[计划] 创建目录: %s", backend.Location(relDir))
 		}
 	}
-	if remoteExists {
-		log.Infof("[计划] 目标已存在，将校验/覆盖: %s", backend.Location(remoteRel))
-	} else {
-		log.Infof("[计划] 上传: %s (%s) -> %s", file.Path, humanize.Bytes(size), backend.Location(remoteRel))
-	}
-	log.Infof("[计划] 上传后读回校验 SHA256")
-	switch o.Txt {
-	case TxtBoth:
-		log.Infof("[计划] 写入远端记录: %s", backend.Location(report.SidecarName(remoteRel)))
-		log.Infof("[计划] 写入本地记录: %s", file.Path+".txt")
-	case TxtRemote:
-		log.Infof("[计划] 写入远端记录: %s", backend.Location(report.SidecarName(remoteRel)))
-	case TxtLocal:
-		log.Infof("[计划] 写入本地记录: %s", file.Path+".txt")
+
+	switch {
+	case willUpload && remoteExists:
+		log.Infof("[计划] 目标已存在，将覆盖上传: %s", backend.Location(remoteRel))
+	case willUpload:
+		log.Infof("[计划] 上传: %s (%s) -> %s", file.Path, humanize.Bytes(st.size), backend.Location(remoteRel))
+	case willSkip:
+		log.Infof("[计划] 目标已存在且存在本目标的上传记录，正式运行将按记录判断是否跳过: %s", backend.Location(remoteRel))
+	case willConflict:
+		log.Infof("[计划] 目标已存在但没有本目标的上传记录，正式运行将报冲突并保留源文件（可加 --force 覆盖）: %s", backend.Location(remoteRel))
 	default:
-		log.Infof("[计划] 不生成上传记录 txt")
+		// Verification is enabled and there is no usable note: the real run
+		// reads the remote file back and decides between skipping and a
+		// conflict.
+		log.Infof("[计划] 目标已存在但没有本目标的上传记录，正式运行将读回远端判断：一致则跳过，不一致则报冲突: %s", backend.Location(remoteRel))
 	}
+
+	switch {
+	case o.NoVerify:
+		log.Infof("[计划] 不计算 SHA256，上传后不读回校验（--no-verify）")
+	case willSkip && o.Recheck:
+		log.Infof("[计划] 跳过前重新读回校验 SHA256（--recheck）")
+	case willSkip:
+		log.Infof("[计划] 跳过时不再读回校验（未指定 --recheck）")
+	case willUpload:
+		log.Infof("[计划] 上传后读回校验 SHA256")
+	default:
+		log.Infof("[计划] 读回远端校验 SHA256 以判断是否已上传")
+	}
+
+	if !willConflict {
+		prefix := ""
+		if remoteExists && !o.Force && !hasRecord {
+			prefix = "若判定已上传，"
+		}
+		switch o.Txt {
+		case TxtBoth:
+			log.Infof("[计划] %s写入远端记录: %s", prefix, backend.Location(report.SidecarName(remoteRel)))
+			log.Infof("[计划] %s写入本地记录: %s", prefix, file.Path+".txt")
+		case TxtRemote:
+			log.Infof("[计划] %s写入远端记录: %s", prefix, backend.Location(report.SidecarName(remoteRel)))
+		case TxtLocal:
+			log.Infof("[计划] %s写入本地记录: %s", prefix, file.Path+".txt")
+		default:
+			log.Infof("[计划] 不生成上传记录 txt")
+		}
+	}
+
 	if !o.KeepSource {
-		log.Infof("[计划] 删除源文件: %s", file.Path)
+		switch {
+		case willUpload || willSkip:
+			log.Infof("[计划] 删除源文件: %s", file.Path)
+		case willConflict:
+			log.Infof("[计划] 冲突时保留源文件: %s", file.Path)
+		default:
+			log.Infof("[计划] 若判定已上传则删除源文件: %s", file.Path)
+		}
+	}
+	return nil
+}
+
+// uniqueTempRel returns a temporary sibling name that cannot collide with a
+// concurrent run working on the same source and target.
+func uniqueTempRel(rel string) string {
+	var suffix [8]byte
+	if _, err := cryptorand.Read(suffix[:]); err == nil {
+		return fmt.Sprintf("%s.nassync.%d.%s.tmp", rel, os.Getpid(), hex.EncodeToString(suffix[:]))
+	}
+	return fmt.Sprintf("%s.nassync.%d.%d.tmp", rel, os.Getpid(), time.Now().UnixNano())
+}
+
+func backendReplacesOnRename(backend storage.Backend) bool {
+	r, ok := backend.(storage.RenameReplacer)
+	return ok && r.RenameReplaces()
+}
+
+// renameReplacing moves tmpRel to rel. Backends whose Rename cannot replace an
+// existing file first move the old file to a backup, so a failed rename keeps
+// the previous remote copy instead of losing it.
+func renameReplacing(backend storage.Backend, tmpRel, rel string) error {
+	if backendReplacesOnRename(backend) {
+		return backend.Rename(tmpRel, rel)
+	}
+
+	backupRel := tmpRel + ".bak"
+	_ = backend.Remove(backupRel)
+	backedUp := false
+	if _, err := backend.Stat(rel); err == nil {
+		if err := backend.Rename(rel, backupRel); err != nil {
+			return fmt.Errorf("备份旧远端文件失败: %w", err)
+		}
+		backedUp = true
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("检查旧远端文件失败: %w", err)
+	}
+
+	if err := backend.Rename(tmpRel, rel); err != nil {
+		if backedUp {
+			if restoreErr := backend.Rename(backupRel, rel); restoreErr != nil {
+				return fmt.Errorf("重命名失败且恢复旧文件失败（旧文件保留在 %s）: %w", backupRel, err)
+			}
+		}
+		return err
+	}
+	if backedUp {
+		_ = backend.Remove(backupRel)
 	}
 	return nil
 }
@@ -1047,7 +1207,7 @@ func uploadFile(ctx context.Context, backend storage.Backend, localPath, remoteR
 	}
 	defer src.Close()
 
-	tmpRel := remoteRel + ".nassync.tmp"
+	tmpRel := uniqueTempRel(remoteRel)
 	_ = backend.Remove(tmpRel)
 
 	dst, err := backend.Create(tmpRel)
@@ -1085,9 +1245,11 @@ func uploadFile(ctx context.Context, backend storage.Backend, localPath, remoteR
 	}
 
 	if overwrite {
-		_ = backend.Remove(remoteRel)
-	}
-	if err := backend.Rename(tmpRel, remoteRel); err != nil {
+		if err := renameReplacing(backend, tmpRel, remoteRel); err != nil {
+			_ = backend.Remove(tmpRel)
+			return "", fmt.Errorf("重命名远端临时文件失败: %w", err)
+		}
+	} else if err := backend.Rename(tmpRel, remoteRel); err != nil {
 		_ = backend.Remove(tmpRel)
 		return "", fmt.Errorf("重命名远端临时文件失败: %w", err)
 	}
@@ -1115,7 +1277,7 @@ func writeRecord(backend storage.Backend, rel, content string) error {
 			return err
 		}
 	}
-	tmpRel := rel + ".tmp"
+	tmpRel := uniqueTempRel(rel)
 	_ = backend.Remove(tmpRel)
 
 	dst, err := backend.Create(tmpRel)
@@ -1134,9 +1296,7 @@ func writeRecord(backend storage.Backend, rel, content string) error {
 		return writeErr
 	}
 
-	// Renaming over an existing file is not portable, remove it first.
-	_ = backend.Remove(rel)
-	if err := backend.Rename(tmpRel, rel); err != nil {
+	if err := renameReplacing(backend, tmpRel, rel); err != nil {
 		_ = backend.Remove(tmpRel)
 		return err
 	}
@@ -1164,17 +1324,32 @@ func readRecord(ctx context.Context, backend storage.Backend, rel string) ([]byt
 // writeLocalRecord stores a copy of the completion note next to the source
 // archive. It is written atomically and survives deletion of the archive.
 func writeLocalRecord(p string, data []byte) error {
-	tmp := p + ".tmp"
+	tmp := uniqueTempRel(p)
 	if err := os.WriteFile(tmp, data, 0o644); err != nil {
 		return err
 	}
-	if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+	backup := tmp + ".bak"
+	_ = os.Remove(backup)
+	backedUp := false
+	if _, err := os.Stat(p); err == nil {
+		if err := os.Rename(p, backup); err != nil {
+			_ = os.Remove(tmp)
+			return err
+		}
+		backedUp = true
+	} else if !os.IsNotExist(err) {
 		_ = os.Remove(tmp)
 		return err
 	}
 	if err := os.Rename(tmp, p); err != nil {
+		if backedUp {
+			_ = os.Rename(backup, p)
+		}
 		_ = os.Remove(tmp)
 		return err
+	}
+	if backedUp {
+		_ = os.Remove(backup)
 	}
 	return nil
 }
@@ -1228,6 +1403,19 @@ func hashLocalFile(ctx context.Context, p string, sink progress.Sink, size int64
 
 func hashRemoteFile(ctx context.Context, backend storage.Backend, rel string, sink progress.Sink, size int64, concurrency int, pool *chunkPool) (string, error) {
 	if rr, ok := backend.(storage.RangeReader); ok && concurrency > 1 && size >= parallelHashMinSize {
+		// Range hashing only fetches the bytes the local file claims to have.
+		// Refuse to hash a remote file with a different size, otherwise extra
+		// trailing bytes on the server would be silently ignored.
+		info, err := backend.Stat(rel)
+		if err != nil {
+			return "", err
+		}
+		if info.IsDir {
+			return "", fmt.Errorf("远端路径是目录: %s", backend.Location(rel))
+		}
+		if info.Size != size {
+			return "", fmt.Errorf("远端文件大小不符（本地 %d，远端 %d）: %s", size, info.Size, backend.Location(rel))
+		}
 		return hashRemoteRanges(ctx, rr, rel, sink, size, concurrency, pool)
 	}
 	f, err := backend.Open(rel)

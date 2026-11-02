@@ -44,6 +44,13 @@ type RangeReader interface {
 	OpenRange(rel string, offset, length int64) (io.ReadCloser, error)
 }
 
+// RenameReplacer is implemented by backends whose Rename can atomically replace
+// an existing destination. Callers must keep the old file until the rename
+// succeeds on backends that do not implement it.
+type RenameReplacer interface {
+	RenameReplaces() bool
+}
+
 // Backend abstracts a remote directory tree. All paths are slash separated and
 // relative to the backend root; the empty string refers to the root itself.
 type Backend interface {
