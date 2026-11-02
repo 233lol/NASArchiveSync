@@ -57,6 +57,8 @@ type Backend struct {
 	host   string
 	port   int
 	root   string
+	target storage.Target
+	opt    storage.Options
 }
 
 // Open connects to the SSH server described by t, authenticates and optionally
@@ -140,6 +142,8 @@ func Open(t storage.Target, opt storage.Options) (storage.Backend, error) {
 		host:   t.Host,
 		port:   port,
 		root:   cleanRoot(t.Path),
+		target: t,
+		opt:    opt,
 	}
 
 	if opt.CreateRoot && b.root != "/" {
@@ -283,6 +287,44 @@ func (b *Backend) Open(rel string) (io.ReadCloser, error) {
 	return b.client.Open(p)
 }
 
+// OpenRange opens a fresh handle and reads a byte range from it.
+func (b *Backend) OpenRange(rel string, offset, length int64) (io.ReadCloser, error) {
+	if offset < 0 || length <= 0 {
+		return nil, fmt.Errorf("无效的 SFTP 读取范围: offset=%d length=%d", offset, length)
+	}
+	p, err := b.resolve(rel)
+	if err != nil {
+		return nil, err
+	}
+	f, err := b.client.Open(p)
+	if err != nil {
+		return nil, err
+	}
+	return storage.NewRangeReadCloser(f, offset, length, f), nil
+}
+
+// List returns the immediate children of a remote directory.
+func (b *Backend) List(rel string) ([]storage.FileInfo, error) {
+	p, err := b.resolve(rel)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := b.client.ReadDir(p)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]storage.FileInfo, 0, len(entries))
+	for _, info := range entries {
+		out = append(out, storage.FileInfo{
+			Name:    info.Name(),
+			Size:    info.Size(),
+			IsDir:   info.IsDir(),
+			ModTime: info.ModTime(),
+		})
+	}
+	return out, nil
+}
+
 func (b *Backend) Create(rel string) (storage.Writer, error) {
 	p, err := b.resolve(rel)
 	if err != nil {
@@ -335,6 +377,26 @@ func (b *Backend) Close() error {
 		b.ssh = nil
 	}
 	return firstErr
+}
+
+// Reconnect rebuilds the SSH/SFTP session after a transient network failure.
+func (b *Backend) Reconnect() error {
+	target, opt := b.target, b.opt
+	_ = b.Close()
+	next, err := Open(target, opt)
+	if err != nil {
+		return err
+	}
+	other, ok := next.(*Backend)
+	if !ok {
+		_ = next.Close()
+		return errors.New("SFTP 重连返回了意外的后端类型")
+	}
+	b.ssh, b.client = other.ssh, other.client
+	b.user, b.host, b.port, b.root = other.user, other.host, other.port, other.root
+	b.target, b.opt = other.target, other.opt
+	other.ssh, other.client = nil, nil
+	return nil
 }
 
 func (b *Backend) resolve(rel string) (string, error) {

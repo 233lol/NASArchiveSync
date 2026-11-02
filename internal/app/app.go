@@ -102,11 +102,27 @@ type Options struct {
 	// VerifyConcurrency is the number of parallel range reads used when a
 	// backend supports them. Values below 2 read the remote file sequentially.
 	VerifyConcurrency int
-	CaseSensitive     bool
-	SMB               SMBOptions
-	SFTP              SFTPOptions
-	S3                S3Options
-	WebDAV            WebDAVOptions
+	// Concurrency is the number of files processed at the same time. Values
+	// above 1 disable the upload/verify pipeline and use one backend per worker.
+	Concurrency int
+	// VerifyOnly checks existing remote files without uploading, writing
+	// records or deleting anything.
+	VerifyOnly bool
+	// CleanTemp removes stale NASArchiveSync temporary files below the target.
+	CleanTemp bool
+	// Timeout bounds connection setup and handshakes.
+	Timeout time.Duration
+	// Retries is the number of extra attempts for transient failures.
+	Retries    int
+	RetryDelay time.Duration
+	// LimitBytesPerSec caps upload and remote verification bandwidth. Zero
+	// means unlimited.
+	LimitBytesPerSec int64
+	CaseSensitive    bool
+	SMB              SMBOptions
+	SFTP             SFTPOptions
+	S3               S3Options
+	WebDAV           WebDAVOptions
 	// SMBMode is "auto" (default), "native" or "builtin". Native means the
 	// operating system's SMB redirector is used and existing Windows
 	// credentials are reused.
@@ -125,6 +141,8 @@ type Options struct {
 	sourcePrefix string
 	// verifyPool reuses range-read buffers across files in one run.
 	verifyPool *chunkPool
+	// limiter throttles upload and remote verification reads.
+	limiter *bandwidthLimiter
 }
 
 // Outcome describes what happened to a single archive.
@@ -134,6 +152,7 @@ const (
 	OutcomeFailed Outcome = iota
 	OutcomeUploaded
 	OutcomeSkipped
+	OutcomeVerified
 	OutcomePlanned
 )
 
@@ -175,13 +194,15 @@ type planState struct {
 
 // Result is the summary of a Run.
 type Result struct {
-	Total    int
-	Uploaded int
-	Skipped  int
-	Planned  int
-	Failed   int
-	Bytes    int64
-	Duration time.Duration
+	Total      int
+	Uploaded   int
+	Skipped    int
+	Verified   int
+	Planned    int
+	Failed     int
+	RemovedTmp int
+	Bytes      int64
+	Duration   time.Duration
 	// HashTime, UploadTime and VerifyTime accumulate per-file phase times.
 	// With --pipeline, upload and verify overlap, so their sum can exceed
 	// Duration.
@@ -190,6 +211,8 @@ type Result struct {
 	VerifyTime time.Duration
 	NoVerify   bool
 	DryRun     bool
+	VerifyOnly bool
+	CleanTemp  bool
 	Failures   []string
 }
 
@@ -203,10 +226,23 @@ func Run(ctx context.Context, o Options) (Result, error) {
 		log = xlog.New(io.Discard, false, false)
 	}
 
-	res := Result{DryRun: o.DryRun, NoVerify: o.NoVerify}
+	res := Result{DryRun: o.DryRun, NoVerify: o.NoVerify, VerifyOnly: o.VerifyOnly, CleanTemp: o.CleanTemp}
+	o.limiter = newBandwidthLimiter(o.LimitBytesPerSec)
 
 	if o.NoVerify && o.Recheck {
 		return res, fmt.Errorf("--recheck 需要读取远端并计算 SHA256，不能与 --no-verify 同时使用")
+	}
+	if o.VerifyOnly && o.NoVerify {
+		return res, fmt.Errorf("--verify-only 需要读取并计算 SHA256，不能与 --no-verify 同时使用")
+	}
+	if o.VerifyOnly && o.DryRun {
+		return res, fmt.Errorf("--verify-only 本身就是只读检查，不能与 --dry-run 同时使用")
+	}
+	if o.CleanTemp && o.DryRun {
+		return res, fmt.Errorf("--clean-temp 会删除文件，不能与 --dry-run 同时使用")
+	}
+	if o.List && (o.CleanTemp || o.VerifyOnly) {
+		return res, fmt.Errorf("--list 只列出文件，不能与 --clean-temp 或 --verify-only 同时使用")
 	}
 
 	txtMode, err := ParseTxtMode(string(o.Txt))
@@ -313,7 +349,7 @@ func Run(ctx context.Context, o Options) (Result, error) {
 		log.Infof("演练模式: 只检查并打印计划，不会上传、写记录或删除文件")
 	}
 	log.Infof("共找到 %d 个待处理归档文件", len(files))
-	if len(files) == 0 {
+	if len(files) == 0 && !o.CleanTemp {
 		res.Duration = time.Since(started)
 		return res, nil
 	}
@@ -333,7 +369,9 @@ func Run(ctx context.Context, o Options) (Result, error) {
 		Password:   o.SMB.Password,
 		Domain:     o.SMB.Domain,
 		Port:       o.SMB.Port,
-		CreateRoot: !o.DryRun,
+		Timeout:    o.Timeout,
+		Context:    ctx,
+		CreateRoot: !o.DryRun && !o.VerifyOnly && !o.CleanTemp,
 		// Several files will reuse the same buffer pool; a single file is
 		// faster to release when the writer is done.
 		ReuseBuffers: len(files) > 1,
@@ -381,7 +419,10 @@ func Run(ctx context.Context, o Options) (Result, error) {
 			log.Warnf("已禁用 WebDAV HTTPS 证书校验（--webdav-insecure），连接可能被中间人攻击")
 		}
 	}
-	uploadBackend, err := backends.Open(target, backendOpts, nativeAccess)
+	openBackend := func() (storage.Backend, error) {
+		return backends.Open(target, backendOpts, nativeAccess)
+	}
+	uploadBackend, err := openBackend()
 	if err != nil {
 		return res, err
 	}
@@ -395,14 +436,44 @@ func Run(ctx context.Context, o Options) (Result, error) {
 		log.Warnf("已关闭校验: 不计算 SHA256，上传后不读回远端文件，上传记录将标记为未校验")
 	}
 
-	if !o.DryRun && o.Pipeline && !o.NoVerify {
-		verifyBackend, openErr := backends.Open(target, backendOpts, nativeAccess)
+	if o.CleanTemp {
+		removed, cleanupErr := cleanRemoteTemps(ctx, o, log, uploadBackend)
+		res.RemovedTmp = removed
+		if cleanupErr != nil {
+			return res, cleanupErr
+		}
+		if !o.VerifyOnly {
+			res.Duration = time.Since(started)
+			return res, nil
+		}
+	}
+	if o.VerifyOnly {
+		runVerifyOnly(ctx, o, log, uploadBackend, files, &res)
+		res.Duration = time.Since(started)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			log.Warnf("已中断")
+			return res, ctxErr
+		}
+		return res, nil
+	}
+
+	workers := o.Concurrency
+	if workers < 1 {
+		workers = 1
+	}
+	switch {
+	case workers > 1 && !o.DryRun:
+		if openErr := runConcurrent(ctx, o, log, uploadBackend, openBackend, files, &res); openErr != nil {
+			return res, openErr
+		}
+	case !o.DryRun && o.Pipeline && !o.NoVerify:
+		verifyBackend, openErr := openBackend()
 		if openErr != nil {
 			return res, openErr
 		}
 		defer verifyBackend.Close()
 		runPipeline(ctx, o, log, uploadBackend, verifyBackend, files, &res)
-	} else {
+	default:
 		runSequential(ctx, o, log, uploadBackend, files, &res)
 	}
 
@@ -431,6 +502,97 @@ func runSequential(ctx context.Context, o Options, log *xlog.Logger, backend sto
 		fr := processFile(ctx, o, log, backend, file, fileContext{index: i, total: len(files)}, plan, newHash, newUpload, false)
 		aggregateResult(res, fr, log)
 	}
+}
+
+type concurrentJob struct {
+	index int
+	file  scan.File
+}
+
+func runConcurrent(ctx context.Context, o Options, log *xlog.Logger, first storage.Backend, open func() (storage.Backend, error), files []scan.File, res *Result) error {
+	workers := o.Concurrency
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > 16 {
+		workers = 16
+	}
+	if workers > len(files) {
+		workers = len(files)
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	backends := make([]storage.Backend, workers)
+	backends[0] = first
+	for i := 1; i < workers; i++ {
+		backend, err := open()
+		if err != nil {
+			for _, opened := range backends[1:i] {
+				_ = opened.Close()
+			}
+			return err
+		}
+		backends[i] = backend
+	}
+	defer func() {
+		for _, backend := range backends[1:] {
+			_ = backend.Close()
+		}
+	}()
+
+	mode := "每个文件上传后在同一会话校验"
+	if o.NoVerify {
+		mode = "每个文件只上传，不校验"
+	}
+	log.Infof("并发模式: %d 个文件同时处理（%s）", workers, mode)
+	jobs := make(chan concurrentJob)
+	results := make(chan fileResult, len(files))
+	var wg sync.WaitGroup
+	for i, backend := range backends {
+		wg.Add(1)
+		go func(index int, backend storage.Backend) {
+			defer wg.Done()
+			workerOpts := o
+			workerOpts.ProgressOut = nil
+			if o.VerifyConcurrency > 1 && len(files) > 1 {
+				verifyWorkers := o.VerifyConcurrency
+				if verifyWorkers > maxVerifyConcurrency {
+					verifyWorkers = maxVerifyConcurrency
+				}
+				workerOpts.verifyPool = newChunkPool(parallelHashChunkSize, verifyWorkers)
+			}
+			plan := &planState{dirs: make(map[string]bool)}
+			discardCounter := func(string, int64) progress.Counter { return progress.Discard }
+			for job := range jobs {
+				if ctx.Err() != nil {
+					return
+				}
+				log.Infof("[%d/%d] %s (%s)", job.index+1, len(files), job.file.Rel, humanize.Bytes(job.file.Size))
+				result := processFile(ctx, workerOpts, log, backend, job.file, fileContext{index: job.index, total: len(files)}, plan, discardCounter, discardCounter, false)
+				results <- result
+			}
+		}(i, backend)
+	}
+
+	go func() {
+		defer close(jobs)
+		for index, file := range files {
+			select {
+			case jobs <- concurrentJob{index: index, file: file}:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+	for result := range results {
+		aggregateResult(res, result, log)
+	}
+	return nil
 }
 
 func runPipeline(ctx context.Context, o Options, log *xlog.Logger, uploadBackend, verifyBackend storage.Backend, files []scan.File, res *Result) {
@@ -540,6 +702,9 @@ func aggregateResult(res *Result, fr fileResult, log *xlog.Logger) {
 		res.Bytes += fr.size
 	case OutcomeSkipped:
 		res.Skipped++
+	case OutcomeVerified:
+		res.Verified++
+		res.Bytes += fr.size
 	case OutcomePlanned:
 		res.Planned++
 	case OutcomeFailed:
@@ -626,6 +791,12 @@ func pathsFor(o Options, backend storage.Backend, file scan.File) filePaths {
 }
 
 func inspectFile(ctx context.Context, o Options, log *xlog.Logger, backend storage.Backend, file scan.File) (*fileState, error) {
+	return retryValue(ctx, o, log, backend, "检查远端", func() (*fileState, error) {
+		return inspectFileOnce(ctx, o, log, backend, file)
+	})
+}
+
+func inspectFileOnce(ctx context.Context, o Options, log *xlog.Logger, backend storage.Backend, file scan.File) (*fileState, error) {
 	info, err := os.Stat(file.Path)
 	if err != nil {
 		return nil, fmt.Errorf("读取源文件失败: %w", err)
@@ -677,7 +848,7 @@ func processFile(ctx context.Context, o Options, log *xlog.Logger, backend stora
 
 	if o.NoVerify {
 		if !o.Force && st.remoteExists {
-			return handleSkipNoVerify(o, log, backend, st)
+			return handleSkipNoVerify(ctx, o, log, backend, st)
 		}
 		return uploadAndRecordNoVerify(ctx, o, log, backend, st, fc, newUpload)
 	}
@@ -710,7 +881,7 @@ func recordMatchesFile(rec *report.Record, size int64, mod time.Time) bool {
 	return rec.SourceModTime.Equal(mod.Truncate(time.Second))
 }
 
-func handleSkipNoVerify(o Options, log *xlog.Logger, backend storage.Backend, st *fileState) fileResult {
+func handleSkipNoVerify(ctx context.Context, o Options, log *xlog.Logger, backend storage.Backend, st *fileState) fileResult {
 	res := fileResult{file: st.file.Rel, size: st.size}
 
 	remoteMatch := st.recErr == nil && recordTargetMatches(st.rec, st.paths.remotePath) &&
@@ -747,7 +918,7 @@ func handleSkipNoVerify(o Options, log *xlog.Logger, backend storage.Backend, st
 		return res
 	}
 
-	if err := ensureRecords(o, backend, st.paths.sidecarRel, st.paths.localNote, content, remoteOK, localOK); err != nil {
+	if err := ensureRecords(ctx, o, log, backend, st.paths.sidecarRel, st.paths.localNote, content, remoteOK, localOK); err != nil {
 		res.outcome = OutcomeFailed
 		res.err = fmt.Errorf("补写上传记录失败，已保留本地源文件: %w", err)
 		return res
@@ -762,7 +933,9 @@ func uploadAndRecordNoVerify(ctx context.Context, o Options, log *xlog.Logger, b
 	res := fileResult{file: st.file.Rel, size: st.size}
 
 	if st.paths.relDir != "" {
-		if err := backend.MkdirAll(st.paths.relDir); err != nil {
+		if err := retryDo(ctx, o, log, backend, "创建远端目录", func() error {
+			return backend.MkdirAll(st.paths.relDir)
+		}); err != nil {
 			res.outcome = OutcomeFailed
 			res.err = fmt.Errorf("创建远端目录失败: %w", err)
 			return res
@@ -772,7 +945,10 @@ func uploadAndRecordNoVerify(ctx context.Context, o Options, log *xlog.Logger, b
 	log.Debugf("上传 %s -> %s（已关闭校验）", st.file.Path, st.paths.remotePath)
 	counter := newUpload(fc.label("上传", st.file.Rel), st.size)
 	uploadStarted := time.Now()
-	_, err := uploadFile(ctx, backend, st.file.Path, st.paths.remoteRel, st.size, o.Force, counter, false)
+	_, err := retryValue(ctx, o, log, backend, "上传", func() (struct{}, error) {
+		_, err := uploadFile(ctx, backend, st.file.Path, st.paths.remoteRel, st.size, o.Force, counter, false, o.limiter, !st.remoteExists)
+		return struct{}{}, err
+	})
 	res.uploadTime = time.Since(uploadStarted)
 	if err != nil {
 		counter.Abort()
@@ -809,7 +985,7 @@ func uploadAndRecordNoVerify(ctx context.Context, o Options, log *xlog.Logger, b
 		NoVerify:      true,
 	}
 	content := []byte(record.Render())
-	if err := ensureRecords(o, backend, st.paths.sidecarRel, st.paths.localNote, content, false, false); err != nil {
+	if err := ensureRecords(ctx, o, log, backend, st.paths.sidecarRel, st.paths.localNote, content, false, false); err != nil {
 		res.outcome = OutcomeFailed
 		res.err = fmt.Errorf("远端文件已上传，但保存上传记录失败，已保留本地源文件: %w", err)
 		return res
@@ -870,7 +1046,9 @@ func handleSkip(ctx context.Context, o Options, log *xlog.Logger, backend storag
 		log.Debugf("没有匹配的上传记录，读回远端文件判断是否已上传: %s", st.paths.remotePath)
 		checkCounter := newHash(fc.label("校验已存在", st.file.Rel), st.size)
 		verifyStart := time.Now()
-		remoteSHA, hashErr := hashRemoteFile(ctx, backend, st.paths.remoteRel, checkCounter, st.size, o.VerifyConcurrency, o.verifyPool)
+		remoteSHA, hashErr := retryValue(ctx, o, log, backend, "校验远端", func() (string, error) {
+			return hashRemoteFile(ctx, backend, st.paths.remoteRel, checkCounter, st.size, o.VerifyConcurrency, o.verifyPool, o.limiter)
+		})
 		res.verifyTime += time.Since(verifyStart)
 		if hashErr != nil {
 			checkCounter.Abort()
@@ -915,7 +1093,9 @@ func handleSkip(ctx context.Context, o Options, log *xlog.Logger, backend storag
 	if o.Recheck && !verified {
 		checkCounter := newHash(fc.label("重新校验", st.file.Rel), st.size)
 		verifyStart := time.Now()
-		remoteSHA, hashErr := hashRemoteFile(ctx, backend, st.paths.remoteRel, checkCounter, st.size, o.VerifyConcurrency, o.verifyPool)
+		remoteSHA, hashErr := retryValue(ctx, o, log, backend, "重新校验远端", func() (string, error) {
+			return hashRemoteFile(ctx, backend, st.paths.remoteRel, checkCounter, st.size, o.VerifyConcurrency, o.verifyPool, o.limiter)
+		})
 		res.verifyTime += time.Since(verifyStart)
 		if hashErr != nil {
 			checkCounter.Abort()
@@ -931,7 +1111,7 @@ func handleSkip(ctx context.Context, o Options, log *xlog.Logger, backend storag
 		}
 	}
 
-	if err := ensureRecords(o, backend, st.paths.sidecarRel, st.paths.localNote, content, remoteOK, localOK); err != nil {
+	if err := ensureRecords(ctx, o, log, backend, st.paths.sidecarRel, st.paths.localNote, content, remoteOK, localOK); err != nil {
 		res.outcome = OutcomeFailed
 		res.err = fmt.Errorf("补写上传记录失败，已保留本地源文件: %w", err)
 		return res
@@ -954,7 +1134,9 @@ func uploadAndVerify(ctx context.Context, o Options, log *xlog.Logger, backend s
 
 func uploadOnly(ctx context.Context, o Options, log *xlog.Logger, backend storage.Backend, st *fileState, fc fileContext, newUpload counterFactory) (string, time.Duration, error) {
 	if st.paths.relDir != "" {
-		if err := backend.MkdirAll(st.paths.relDir); err != nil {
+		if err := retryDo(ctx, o, log, backend, "创建远端目录", func() error {
+			return backend.MkdirAll(st.paths.relDir)
+		}); err != nil {
 			return "", 0, fmt.Errorf("创建远端目录失败: %w", err)
 		}
 	}
@@ -962,7 +1144,9 @@ func uploadOnly(ctx context.Context, o Options, log *xlog.Logger, backend storag
 	log.Debugf("上传 %s -> %s", st.file.Path, st.paths.remotePath)
 	counter := newUpload(fc.label("上传", st.file.Rel), st.size)
 	uploadStarted := time.Now()
-	localSHA, err := uploadFile(ctx, backend, st.file.Path, st.paths.remoteRel, st.size, o.Force, counter, true)
+	localSHA, err := retryValue(ctx, o, log, backend, "上传", func() (string, error) {
+		return uploadFile(ctx, backend, st.file.Path, st.paths.remoteRel, st.size, o.Force, counter, true, o.limiter, !st.remoteExists)
+	})
 	uploadDuration := time.Since(uploadStarted)
 	if err != nil {
 		counter.Abort()
@@ -993,7 +1177,9 @@ func verifyUploaded(ctx context.Context, o Options, log *xlog.Logger, backend st
 
 	counter := newHash(fc.label("校验远端", st.file.Rel), st.size)
 	verifyStart := time.Now()
-	remoteSHA, err := hashRemoteFile(ctx, backend, st.paths.remoteRel, counter, st.size, o.VerifyConcurrency, o.verifyPool)
+	remoteSHA, err := retryValue(ctx, o, log, backend, "校验远端", func() (string, error) {
+		return hashRemoteFile(ctx, backend, st.paths.remoteRel, counter, st.size, o.VerifyConcurrency, o.verifyPool, o.limiter)
+	})
 	res.verifyTime = time.Since(verifyStart)
 	if err != nil {
 		counter.Abort()
@@ -1026,7 +1212,7 @@ func verifyUploaded(ctx context.Context, o Options, log *xlog.Logger, backend st
 		Verified:      true,
 	}
 	content := []byte(record.Render())
-	if err := ensureRecords(o, backend, st.paths.sidecarRel, st.paths.localNote, content, false, false); err != nil {
+	if err := ensureRecords(ctx, o, log, backend, st.paths.sidecarRel, st.paths.localNote, content, false, false); err != nil {
 		res.outcome = OutcomeFailed
 		res.err = fmt.Errorf("远端文件已上传并校验通过，但保存上传记录失败，已保留本地源文件: %w", err)
 		return res
@@ -1200,19 +1386,32 @@ func renameReplacing(backend storage.Backend, tmpRel, rel string) error {
 	return nil
 }
 
-func uploadFile(ctx context.Context, backend storage.Backend, localPath, remoteRel string, size int64, overwrite bool, sink progress.Sink, computeHash bool) (string, error) {
+func uploadFile(ctx context.Context, backend storage.Backend, localPath, remoteRel string, size int64, overwrite bool, sink progress.Sink, computeHash bool, limiter *bandwidthLimiter, direct bool) (string, error) {
 	src, err := os.Open(localPath)
 	if err != nil {
 		return "", fmt.Errorf("打开源文件失败: %w", err)
 	}
 	defer src.Close()
 
-	tmpRel := uniqueTempRel(remoteRel)
-	_ = backend.Remove(tmpRel)
-
-	dst, err := backend.Create(tmpRel)
-	if err != nil {
-		return "", fmt.Errorf("创建远端临时文件失败: %w", err)
+	tmpRel := ""
+	directWrite := false
+	var dst storage.Writer
+	if direct {
+		if creator, ok := backend.(storage.AtomicCreator); ok {
+			dst, err = creator.CreateAtomic(remoteRel)
+			if err != nil {
+				return "", fmt.Errorf("创建远端文件失败: %w", err)
+			}
+			directWrite = true
+		}
+	}
+	if !directWrite {
+		tmpRel = uniqueTempRel(remoteRel)
+		_ = backend.Remove(tmpRel)
+		dst, err = backend.Create(tmpRel)
+		if err != nil {
+			return "", fmt.Errorf("创建远端临时文件失败: %w", err)
+		}
 	}
 	if sized, ok := dst.(storage.SizedWriter); ok {
 		sized.SetSize(size)
@@ -1222,6 +1421,7 @@ func uploadFile(ctx context.Context, backend storage.Backend, localPath, remoteR
 	// read once for a new upload. --no-verify skips hashing entirely.
 	h := sha256.New()
 	var reader io.Reader = progress.NewReader(ctxReader{ctx: ctx, r: src}, sink)
+	reader = newLimitedReader(ctx, reader, limiter)
 	if computeHash {
 		reader = io.TeeReader(reader, h)
 	}
@@ -1240,10 +1440,18 @@ func uploadFile(ctx context.Context, backend storage.Backend, localPath, remoteR
 		copyErr = closeErr
 	}
 	if copyErr != nil {
-		_ = backend.Remove(tmpRel)
+		if !directWrite {
+			_ = backend.Remove(tmpRel)
+		}
 		return "", fmt.Errorf("上传失败: %w", copyErr)
 	}
 
+	if directWrite {
+		if !computeHash {
+			return "", nil
+		}
+		return hex.EncodeToString(h.Sum(nil)), nil
+	}
 	if overwrite {
 		if err := renameReplacing(backend, tmpRel, remoteRel); err != nil {
 			_ = backend.Remove(tmpRel)
@@ -1277,13 +1485,34 @@ func writeRecord(backend storage.Backend, rel, content string) error {
 			return err
 		}
 	}
+	if creator, ok := backend.(storage.AtomicCreator); ok {
+		dst, err := creator.CreateAtomic(rel)
+		if err != nil {
+			return err
+		}
+		return writeRecordContent(dst, content, nil)
+	}
+
 	tmpRel := uniqueTempRel(rel)
 	_ = backend.Remove(tmpRel)
-
 	dst, err := backend.Create(tmpRel)
 	if err != nil {
 		return err
 	}
+	if err := writeRecordContent(dst, content, func() error {
+		return backend.Remove(tmpRel)
+	}); err != nil {
+		return err
+	}
+
+	if err := renameReplacing(backend, tmpRel, rel); err != nil {
+		_ = backend.Remove(tmpRel)
+		return err
+	}
+	return nil
+}
+
+func writeRecordContent(dst storage.Writer, content string, cleanup func() error) error {
 	_, writeErr := io.WriteString(dst, content)
 	if writeErr == nil {
 		writeErr = dst.Sync()
@@ -1292,13 +1521,10 @@ func writeRecord(backend storage.Backend, rel, content string) error {
 		writeErr = closeErr
 	}
 	if writeErr != nil {
-		_ = backend.Remove(tmpRel)
+		if cleanup != nil {
+			_ = cleanup()
+		}
 		return writeErr
-	}
-
-	if err := renameReplacing(backend, tmpRel, rel); err != nil {
-		_ = backend.Remove(tmpRel)
-		return err
 	}
 	return nil
 }
@@ -1374,9 +1600,11 @@ func readLocalRecord(archivePath string) ([]byte, *report.Record, error) {
 
 // ensureRecords writes the completion note to the sides selected by --txt.
 // remoteOK/localOK tell it that an up to date note already exists there.
-func ensureRecords(o Options, backend storage.Backend, sidecarRel, localNote string, content []byte, remoteOK, localOK bool) error {
+func ensureRecords(ctx context.Context, o Options, log *xlog.Logger, backend storage.Backend, sidecarRel, localNote string, content []byte, remoteOK, localOK bool) error {
 	if o.Txt.WritesRemote() && !remoteOK {
-		if err := writeRecord(backend, sidecarRel, string(content)); err != nil {
+		if err := retryDo(ctx, o, log, backend, "写入远端记录", func() error {
+			return writeRecord(backend, sidecarRel, string(content))
+		}); err != nil {
 			return fmt.Errorf("写入远端上传记录失败: %w", err)
 		}
 	}
@@ -1398,10 +1626,10 @@ func hashLocalFile(ctx context.Context, p string, sink progress.Sink, size int64
 		return "", err
 	}
 	defer f.Close()
-	return hashReader(ctx, f, sink, size)
+	return hashReader(ctx, f, sink, size, nil)
 }
 
-func hashRemoteFile(ctx context.Context, backend storage.Backend, rel string, sink progress.Sink, size int64, concurrency int, pool *chunkPool) (string, error) {
+func hashRemoteFile(ctx context.Context, backend storage.Backend, rel string, sink progress.Sink, size int64, concurrency int, pool *chunkPool, limiter *bandwidthLimiter) (string, error) {
 	if rr, ok := backend.(storage.RangeReader); ok && concurrency > 1 && size >= parallelHashMinSize {
 		// Range hashing only fetches the bytes the local file claims to have.
 		// Refuse to hash a remote file with a different size, otherwise extra
@@ -1416,19 +1644,21 @@ func hashRemoteFile(ctx context.Context, backend storage.Backend, rel string, si
 		if info.Size != size {
 			return "", fmt.Errorf("远端文件大小不符（本地 %d，远端 %d）: %s", size, info.Size, backend.Location(rel))
 		}
-		return hashRemoteRanges(ctx, rr, rel, sink, size, concurrency, pool)
+		return hashRemoteRanges(ctx, rr, rel, sink, size, concurrency, pool, limiter)
 	}
 	f, err := backend.Open(rel)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
-	return hashReader(ctx, f, sink, size)
+	return hashReader(ctx, f, sink, size, limiter)
 }
 
-func hashReader(ctx context.Context, r io.Reader, sink progress.Sink, size int64) (string, error) {
+func hashReader(ctx context.Context, r io.Reader, sink progress.Sink, size int64, limiter *bandwidthLimiter) (string, error) {
 	h := sha256.New()
-	if _, err := io.CopyBuffer(h, progress.NewReader(ctxReader{ctx: ctx, r: r}, sink), make([]byte, bufferSizeFor(size))); err != nil {
+	reader := io.Reader(progress.NewReader(ctxReader{ctx: ctx, r: r}, sink))
+	reader = newLimitedReader(ctx, reader, limiter)
+	if _, err := io.CopyBuffer(h, reader, make([]byte, bufferSizeFor(size))); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
@@ -1576,11 +1806,17 @@ func PrintResult(w io.Writer, r Result) {
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "──────── 处理结果 ────────")
 	fmt.Fprintf(w, "扫描文件   : %d\n", r.Total)
-	if r.DryRun {
+	switch {
+	case r.VerifyOnly:
+		fmt.Fprintf(w, "校验通过   : %d (%s)\n", r.Verified, humanize.Bytes(r.Bytes))
+	case r.DryRun:
 		fmt.Fprintf(w, "计划处理   : %d\n", r.Planned)
-	} else {
+	case !r.CleanTemp || r.Uploaded > 0 || r.Skipped > 0 || r.Planned > 0:
 		fmt.Fprintf(w, "上传成功   : %d (%s)\n", r.Uploaded, humanize.Bytes(r.Bytes))
 		fmt.Fprintf(w, "跳过       : %d\n", r.Skipped)
+	}
+	if r.CleanTemp {
+		fmt.Fprintf(w, "清理临时   : %d\n", r.RemovedTmp)
 	}
 	fmt.Fprintf(w, "失败       : %d\n", r.Failed)
 	if r.NoVerify {

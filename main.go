@@ -7,6 +7,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/alexflint/go-arg"
 	"golang.org/x/term"
@@ -37,7 +38,14 @@ type cliArgs struct {
 	KeepSource     bool     `arg:"--keep-source" help:"上传成功后保留本地压缩包"`
 	Force          bool     `arg:"--force" help:"目标已存在且内容不一致时覆盖"`
 	Recheck        bool     `arg:"--recheck" help:"跳过已上传文件时重新读回远端校验 SHA256"`
-	VerifyConc     int      `arg:"--verify-concurrency" default:"4" help:"远端校验的并发读连接数，默认 4；1 表示顺序读取（需要后端支持分片读取，S3/WebDAV 支持）"`
+	VerifyConc     int      `arg:"--verify-concurrency" default:"4" help:"远端校验的并发读连接数，默认 4；1 表示顺序读取"`
+	Concurrency    int      `arg:"--concurrency" default:"1" help:"同时处理的文件数，1 表示使用上传/校验流水线，最大 16"`
+	VerifyOnly     bool     `arg:"--verify-only" help:"只校验已有远端文件，不上传、不写记录、不删除"`
+	CleanTemp      bool     `arg:"--clean-temp" help:"清理目标目录下本工具遗留的临时文件，清理后退出"`
+	TimeoutSec     int      `arg:"--timeout" default:"30" help:"连接/握手超时（秒）"`
+	Retries        int      `arg:"--retries" default:"3" help:"瞬时错误重试次数，0 表示不重试"`
+	RetryDelaySec  int      `arg:"--retry-delay" default:"1" help:"首次重试等待（秒），之后指数退避"`
+	LimitMB        int      `arg:"--limit" default:"0" help:"上传/校验总带宽上限（MiB/s），0 表示不限"`
 	CaseSensitive  bool     `arg:"--case-sensitive" help:"包含/排除模式区分大小写（默认不区分）"`
 	SMBUser        string   `arg:"--smb-user,env:NAS_SMB_USER" help:"SMB 用户名，留空表示匿名"`
 	SMBPass        string   `arg:"--smb-pass,env:NAS_SMB_PASS" help:"SMB 密码，建议使用环境变量 NAS_SMB_PASS"`
@@ -150,6 +158,18 @@ func (cliArgs) Epilogue() string {
   # S3 虚拟主机模式（endpoint 需要支持 oss.域名 解析）
   NASArchiveSync -s "C:\game" -t "s3://oss/game" --s3-endpoint "http://192.168.1.5.nip.io:3900" --s3-region garage --s3-style virtual
 
+  # 网络不稳定时自动重试，并限制总带宽
+  NASArchiveSync -s "C:\game" -t "\\192.168.12.1\mnt\hdd1\game" --retries 5 --retry-delay 2 --limit 50
+
+  # 同时处理 4 个文件（每个 worker 使用独立会话）
+  NASArchiveSync -s "C:\game" -t "s3://oss/game" --concurrency 4
+
+  # 只审计远端文件，不上传、不写记录、不删除
+  NASArchiveSync -s "C:\game" -t "\\192.168.12.1\mnt\hdd1\game" --verify-only
+
+  # 清理本工具遗留的临时文件
+  NASArchiveSync -s "C:\game" -t "\\192.168.12.1\mnt\hdd1\game" --clean-temp
+
 匹配模式:
   * 匹配任意字符，? 匹配单个字符，** 匹配多级目录，{a,b} 匹配多选一。
   不含 / 的模式匹配任意层级的目录名或文件名，例如 --exclude temp。
@@ -221,6 +241,42 @@ func run() int {
 	}
 	if args.VerifyConc < 1 || args.VerifyConc > 16 {
 		logger.Errorf("--verify-concurrency 必须在 1-16 之间")
+		return 2
+	}
+	if args.Concurrency < 1 || args.Concurrency > 16 {
+		logger.Errorf("--concurrency 必须在 1-16 之间")
+		return 2
+	}
+	if args.TimeoutSec < 1 || args.TimeoutSec > 3600 {
+		logger.Errorf("--timeout 必须在 1-3600 秒之间")
+		return 2
+	}
+	if args.Retries < 0 || args.Retries > 20 {
+		logger.Errorf("--retries 必须在 0-20 之间")
+		return 2
+	}
+	if args.RetryDelaySec < 0 || args.RetryDelaySec > 3600 {
+		logger.Errorf("--retry-delay 必须在 0-3600 秒之间")
+		return 2
+	}
+	if args.LimitMB < 0 {
+		logger.Errorf("--limit 不能为负数")
+		return 2
+	}
+	if args.VerifyOnly && args.NoVerify {
+		logger.Errorf("--verify-only 需要读取并计算 SHA256，不能与 --no-verify 同时使用")
+		return 2
+	}
+	if args.VerifyOnly && args.DryRun {
+		logger.Errorf("--verify-only 本身就是只读检查，不能与 --dry-run 同时使用")
+		return 2
+	}
+	if args.CleanTemp && args.DryRun {
+		logger.Errorf("--clean-temp 会删除文件，不能与 --dry-run 同时使用")
+		return 2
+	}
+	if args.List && (args.CleanTemp || args.VerifyOnly) {
+		logger.Errorf("--list 只列出文件，不能与 --clean-temp 或 --verify-only 同时使用")
 		return 2
 	}
 
@@ -312,6 +368,13 @@ func run() int {
 		Pipeline:          !args.NoPipeline,
 		NoVerify:          args.NoVerify,
 		VerifyConcurrency: args.VerifyConc,
+		Concurrency:       args.Concurrency,
+		VerifyOnly:        args.VerifyOnly,
+		CleanTemp:         args.CleanTemp,
+		Timeout:           time.Duration(args.TimeoutSec) * time.Second,
+		Retries:           args.Retries,
+		RetryDelay:        time.Duration(args.RetryDelaySec) * time.Second,
+		LimitBytesPerSec:  int64(args.LimitMB) << 20,
 		CaseSensitive:     args.CaseSensitive,
 		SMB: app.SMBOptions{
 			User:     args.SMBUser,

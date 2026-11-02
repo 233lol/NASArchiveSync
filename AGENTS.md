@@ -36,12 +36,20 @@ local archive only if it is unchanged.
 
 Pipeline mode is the default: upload N+1 and verify N concurrently using **two independent
 backend sessions** (queue length 1). A verification failure removes the remote file/sidecar/
-temp file, keeps the source and continues; it must not abort the whole run.
+temp file, keeps the source and continues; it must not abort the whole run. `--concurrency N`
+(>1) instead opens N independent backends and processes N files at once, with upload and verify
+sequential inside each worker. Transient failures are retried by `retryValue`, which asks
+`storage.Reconnector` backends to rebuild their session first.
+
+`--verify-only` is a read-only audit path: it hashes the local and remote copies without
+uploading, writing records or deleting. `--clean-temp` uses `storage.Lister` to remove only
+this tool's temporary files and then exits.
 
 ## Adding a storage protocol
 
 The abstraction is `internal/storage/storage.go` (`Backend`, `Writer`, `SizedWriter`,
-`RangeReader`, `RenameReplacer`, `Target`, `Options`). A new protocol needs all of:
+`RangeReader`, `RenameReplacer`, `Reconnector`, `AtomicCreator`, `Lister`, `Target`,
+`Options`). A new protocol needs all of:
 
 1. Implementation under `internal/storage/<proto>` (`Open`, CRUD, `Rename`, `Close`).
 2. Address parsing in `storage.ParseTarget` (and tests in `storage_test.go`).
@@ -67,6 +75,18 @@ The abstraction is `internal/storage/storage.go` (`Backend`, `Writer`, `SizedWri
   Clean remote temp/sidecar artifacts on failure, never the local source.
 - Range-based parallel verification must compare the remote size with the expected size
   before hashing; otherwise extra trailing bytes would be ignored.
+- Retries must only cover transient errors (timeouts, reset/broken connections, EOF, HTTP
+  408/429/5xx). Never retry authentication, path conflicts, local file errors or cancellation.
+  SMB/SFTP `Reconnect` must rebuild both the transport and the protocol session.
+- `--concurrency > 1` disables the pipeline and requires one backend per worker. Workers must
+  not share a `Writer`; they may share the bandwidth limiter, which is mutex-protected.
+- `--verify-only` must never upload, write records or delete. It always hashes both copies and
+  is incompatible with `--no-verify` and `--dry-run`.
+- `--clean-temp` may only remove names matching the tool's `.nassync.*.tmp` /
+  `.nassync.tmp` convention; never archives, completion notes or `.bak` backups.
+- S3 direct writes (`AtomicCreator`) may only be used when no previous remote object has to be
+  preserved. Overwriting an existing key still uses the temporary-object + rename path.
+- The shared bandwidth limiter covers uploads and remote verification reads, not local hashing.
 - `internal/report/report.go` is a parser contract, not just text: `key: value` lines,
   SHA256 required unless `校验方式: none`. Renaming keys/messages breaks skip detection.
 - An existing remote file with no usable matching record is a conflict; only `--force`
@@ -85,16 +105,20 @@ The abstraction is `internal/storage/storage.go` (`Backend`, `Writer`, `SizedWri
 - **S3**: the bucket must already exist (`HeadBucket` at open, never created). Optional
   checksum headers are disabled for Garage/MinIO compatibility. `s3://bucket/prefix` is a
   key prefix, not a directory. `auto` style = path for IP/localhost/single-label hosts,
-  virtual for domains. `Rename` is CopyObject + delete; >5 GiB uses multipart copy.
+  virtual for domains. New objects use `CreateAtomic` (direct PutObject/CompleteMultipartUpload);
+  overwrites and records still use temp-key + CopyObject + delete. `Rename` is CopyObject +
+  delete; >5 GiB uses multipart copy.
 - **WebDAV**: OpenList/AList's WebDAV root is `/dav/`, not the web root. MKCOL and PROPFIND
   follow exactly one trailing-slash redirect; other redirects are errors (credential leak /
   body replay). Bulk reads require `206` with exact `Content-Length`/`Content-Range`; if a
   server ignores `Range`, tell the user to use `--verify-concurrency 1`. MOVE falls back to
   COPY + DELETE.
-- **Parallel verification** only runs when the backend implements `storage.RangeReader`,
-  concurrency > 1 and the file is ≥32 MiB. It uses 16 MiB chunks read concurrently but hashed
-  strictly in order; memory ≈ `16 MiB × concurrency`, capped at 256 MiB.
-- **Memory**: S3 upload ≈ `(concurrency + 1) × part size`. Low-memory recipe:
+- **Parallel verification** runs for every backend implementing `storage.RangeReader` (S3,
+  WebDAV, SFTP, SMB, local/native) when concurrency > 1 and the file is ≥32 MiB. It uses
+  16 MiB chunks read concurrently but hashed strictly in order; memory ≈
+  `16 MiB × concurrency`, capped at 256 MiB per hash. SMB/SFTP open one handle per range.
+- **Memory**: S3 upload ≈ `(concurrency + 1) × part size`. `--concurrency N` multiplies this
+  and verification buffers by N. Low-memory recipe:
   `--s3-part-size 8 --s3-concurrency 4 --verify-concurrency 2`.
 
 ## Testing notes

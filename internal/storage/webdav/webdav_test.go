@@ -34,6 +34,28 @@ func TestParseFileInfoNotFoundPropstat(t *testing.T) {
 	}
 }
 
+func TestParseListSkipsSelfAndParsesChildren(t *testing.T) {
+	body := []byte(`<?xml version="1.0"?>
+<D:multistatus xmlns:D="DAV:">
+  <D:response><D:href>/dav/base/</D:href><D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>
+  <D:response><D:href>/dav/base/file.zip</D:href><D:propstat><D:prop><D:resourcetype/><D:getcontentlength>12</D:getcontentlength><D:getlastmodified>Sat, 24 Oct 2026 12:00:00 GMT</D:getlastmodified></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>
+  <D:response><D:href>/dav/base/sub/</D:href><D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>
+</D:multistatus>`)
+	items, err := parseList(body, "/dav/base")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("items = %+v, want 2", items)
+	}
+	if items[0].Name != "file.zip" || items[0].IsDir || items[0].Size != 12 {
+		t.Errorf("file item = %+v", items[0])
+	}
+	if items[1].Name != "sub" || !items[1].IsDir {
+		t.Errorf("dir item = %+v", items[1])
+	}
+}
+
 func TestBackendCRUD(t *testing.T) {
 	fake := newFakeDAV()
 	srv := httptest.NewServer(fake)
@@ -78,6 +100,14 @@ func TestBackendCRUD(t *testing.T) {
 	}
 	if info.IsDir || info.Size != int64(len(content)) || info.Name != name {
 		t.Errorf("Stat = %+v", info)
+	}
+
+	items, err := b.List("a/b")
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(items) != 1 || items[0].Name != name || items[0].Size != int64(len(content)) {
+		t.Errorf("List = %+v", items)
 	}
 
 	rc, err := b.Open("a/b/" + name)
@@ -386,7 +416,7 @@ func (f *fakeDAV) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p := clean(r.URL.Path)
 	switch r.Method {
 	case "PROPFIND":
-		f.propfind(w, p)
+		f.propfind(w, p, r.Header.Get("Depth"))
 	case "MKCOL":
 		f.mkcol(w, p)
 	case "PUT":
@@ -404,37 +434,65 @@ func (f *fakeDAV) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (f *fakeDAV) propfind(w http.ResponseWriter, p string) {
+func (f *fakeDAV) propfind(w http.ResponseWriter, p, depth string) {
 	f.mu.Lock()
 	data, isFile := f.files[p]
 	isDir := f.dirs[p]
+	children := make(map[string][]byte)
+	childDirs := make(map[string]bool)
+	if isDir && depth == "1" {
+		prefix := strings.TrimSuffix(p, "/") + "/"
+		for name, body := range f.files {
+			if strings.HasPrefix(name, prefix) && !strings.Contains(strings.TrimPrefix(name, prefix), "/") {
+				children[name] = body
+			}
+		}
+		for name := range f.dirs {
+			if strings.HasPrefix(name, prefix) && !strings.Contains(strings.TrimPrefix(name, prefix), "/") {
+				childDirs[name] = true
+			}
+		}
+	}
 	f.mu.Unlock()
 	if !isFile && !isDir {
 		http.NotFound(w, nil)
 		return
 	}
+
+	var b strings.Builder
+	b.WriteString(`<?xml version="1.0" encoding="utf-8"?>`)
+	b.WriteString(`<D:multistatus xmlns:D="DAV:">`)
+	writeDAVResponse(&b, p, data, isFile, isDir)
+	for name, body := range children {
+		writeDAVResponse(&b, name, body, true, false)
+	}
+	for name := range childDirs {
+		writeDAVResponse(&b, name, nil, false, true)
+	}
+	b.WriteString(`</D:multistatus>`)
+	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+	w.WriteHeader(http.StatusMultiStatus)
+	_, _ = io.WriteString(w, b.String())
+}
+
+func writeDAVResponse(b *strings.Builder, p string, data []byte, isFile, isDir bool) {
 	href := (&url.URL{Path: p}).EscapedPath()
 	if isDir && !strings.HasSuffix(href, "/") {
 		href += "/"
 	}
-	var b strings.Builder
-	b.WriteString(`<?xml version="1.0" encoding="utf-8"?>`)
-	b.WriteString(`<D:multistatus xmlns:D="DAV:"><D:response><D:href>`)
-	xmlEscape(&b, href)
+	b.WriteString(`<D:response><D:href>`)
+	xmlEscape(b, href)
 	b.WriteString(`</D:href><D:propstat><D:prop><D:resourcetype>`)
 	if isDir {
 		b.WriteString(`<D:collection/>`)
 	}
 	b.WriteString(`</D:resourcetype>`)
 	if isFile {
-		fmt.Fprintf(&b, `<D:getcontentlength>%d</D:getcontentlength>`, len(data))
+		fmt.Fprintf(b, `<D:getcontentlength>%d</D:getcontentlength>`, len(data))
 	}
 	b.WriteString(`<D:getlastmodified>`)
-	xmlEscape(&b, time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC).Format(http.TimeFormat))
-	b.WriteString(`</D:getlastmodified></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>`)
-	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
-	w.WriteHeader(http.StatusMultiStatus)
-	_, _ = io.WriteString(w, b.String())
+	xmlEscape(b, time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC).Format(http.TimeFormat))
+	b.WriteString(`</D:getlastmodified></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>`)
 }
 
 func xmlEscape(b *strings.Builder, s string) {

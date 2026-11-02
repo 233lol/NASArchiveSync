@@ -59,6 +59,31 @@ func TestNormalizeEndpoint(t *testing.T) {
 	}
 }
 
+func TestCreateAtomicWritesFinalKey(t *testing.T) {
+	fake := newFakeS3()
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+
+	b := openTestBackend(t, srv, "path", "base", false)
+	creator, ok := b.(storage.AtomicCreator)
+	if !ok {
+		t.Fatal("S3 backend does not implement AtomicCreator")
+	}
+	w, err := creator.CreateAtomic("dir/atomic.zip")
+	if err != nil {
+		t.Fatalf("CreateAtomic: %v", err)
+	}
+	if _, err := io.WriteString(w, "atomic-content"); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(fake.object("base/dir/atomic.zip")); got != "atomic-content" {
+		t.Errorf("stored body = %q", got)
+	}
+}
+
 func TestCopySourceEscapesSegments(t *testing.T) {
 	got := copySource("oss", "a b/中文/100%.zip")
 	want := "oss/a%20b/%E4%B8%AD%E6%96%87/100%25.zip"

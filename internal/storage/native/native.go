@@ -9,6 +9,7 @@ package native
 
 import (
 	"fmt"
+	"io"
 	"runtime"
 
 	"github.com/fjf/NASArchiveSync/internal/storage"
@@ -42,3 +43,21 @@ func (b *Backend) Kind() string { return "smb-native" }
 // RenameReplaces follows the local backend semantics. On Windows the system
 // rename does not replace an existing file.
 func (b *Backend) RenameReplaces() bool { return runtime.GOOS != "windows" }
+
+// OpenRange delegates to the underlying local backend.
+func (b *Backend) OpenRange(rel string, offset, length int64) (io.ReadCloser, error) {
+	rr, ok := b.Backend.(storage.RangeReader)
+	if !ok {
+		return nil, fmt.Errorf("系统级 SMB 后端不支持范围读取")
+	}
+	return rr.OpenRange(rel, offset, length)
+}
+
+// List delegates to the underlying local backend.
+func (b *Backend) List(rel string) ([]storage.FileInfo, error) {
+	lister, ok := b.Backend.(storage.Lister)
+	if !ok {
+		return nil, fmt.Errorf("系统级 SMB 后端不支持目录列表")
+	}
+	return lister.List(rel)
+}

@@ -70,11 +70,11 @@ func (p *chunkPool) put(b []byte) {
 // hashRemoteRanges computes the SHA256 of a remote file by fetching fixed-size
 // byte ranges concurrently. Chunks are still hashed strictly in order, so the
 // result is exactly the same as reading the file sequentially.
-func hashRemoteRanges(ctx context.Context, rr storage.RangeReader, rel string, sink progress.Sink, size int64, concurrency int, pool *chunkPool) (string, error) {
-	return hashRemoteRangesChunked(ctx, rr, rel, sink, size, concurrency, parallelHashChunkSize, pool)
+func hashRemoteRanges(ctx context.Context, rr storage.RangeReader, rel string, sink progress.Sink, size int64, concurrency int, pool *chunkPool, limiter *bandwidthLimiter) (string, error) {
+	return hashRemoteRangesChunked(ctx, rr, rel, sink, size, concurrency, parallelHashChunkSize, pool, limiter)
 }
 
-func hashRemoteRangesChunked(ctx context.Context, rr storage.RangeReader, rel string, sink progress.Sink, size int64, concurrency int, chunkSize int64, pool *chunkPool) (string, error) {
+func hashRemoteRangesChunked(ctx context.Context, rr storage.RangeReader, rel string, sink progress.Sink, size int64, concurrency int, chunkSize int64, pool *chunkPool, limiter *bandwidthLimiter) (string, error) {
 	nChunks := int((size + chunkSize - 1) / chunkSize)
 
 	workers := concurrency
@@ -156,7 +156,7 @@ func hashRemoteRangesChunked(ctx context.Context, rr storage.RangeReader, rel st
 					buf = buf[:length]
 				}
 
-				n, err := readRange(ctx, rr, rel, start, length, buf, sink)
+				n, err := readRange(ctx, rr, rel, start, length, buf, sink, limiter)
 				if err == nil && int64(n) != length {
 					err = io.ErrUnexpectedEOF
 				}
@@ -242,7 +242,7 @@ func drainBuffers(free chan []byte, pool *chunkPool) {
 }
 
 // readRange fetches one range into buf and reports progress as bytes arrive.
-func readRange(ctx context.Context, rr storage.RangeReader, rel string, offset, length int64, buf []byte, sink progress.Sink) (int, error) {
+func readRange(ctx context.Context, rr storage.RangeReader, rel string, offset, length int64, buf []byte, sink progress.Sink, limiter *bandwidthLimiter) (int, error) {
 	rc, err := rr.OpenRange(rel, offset, length)
 	if err != nil {
 		return 0, err
@@ -253,5 +253,6 @@ func readRange(ctx context.Context, rr storage.RangeReader, rel string, offset, 
 	if sink != nil {
 		r = progress.NewReader(r, sink)
 	}
+	r = newLimitedReader(ctx, r, limiter)
 	return io.ReadFull(r, buf)
 }

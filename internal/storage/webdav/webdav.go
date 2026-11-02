@@ -50,6 +50,7 @@ const propfindBody = `<?xml version="1.0" encoding="utf-8"?>
 // Backend stores files under a directory on a WebDAV server.
 type Backend struct {
 	http     *http.Client
+	ctx      context.Context
 	base     *url.URL // http(s)://host[:port]
 	display  string   // webdav or webdavs
 	rootPath string
@@ -104,8 +105,13 @@ func Open(t storage.Target, opt storage.Options) (storage.Backend, error) {
 	}
 	client := newHTTPClient(timeout, opt.WebDAVInsecure)
 
+	baseCtx := opt.Context
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
 	b := &Backend{
 		http:     client,
+		ctx:      baseCtx,
 		base:     &url.URL{Scheme: scheme, Host: hostPort},
 		display:  displayScheme,
 		rootPath: cleanPath(t.Path),
@@ -318,14 +324,18 @@ func isRedirect(status int) bool {
 // propfind follows a directory redirect once, matching how MKCOL handles
 // collection URLs without a trailing slash.
 func (b *Backend) propfind(p string) (*http.Response, error) {
-	resp, err := b.do(methodPROPFIND, p, strings.NewReader(propfindBody), int64(len(propfindBody)))
+	return b.propfindDepth(p, "0")
+}
+
+func (b *Backend) propfindDepth(p, depth string) (*http.Response, error) {
+	resp, err := b.doDepth(methodPROPFIND, p, strings.NewReader(propfindBody), int64(len(propfindBody)), depth)
 	if err != nil {
 		return nil, err
 	}
 	if isRedirect(resp.StatusCode) && !strings.HasSuffix(p, "/") {
 		_ = drain(resp)
 		_ = resp.Body.Close()
-		return b.do(methodPROPFIND, p+"/", strings.NewReader(propfindBody), int64(len(propfindBody)))
+		return b.doDepth(methodPROPFIND, p+"/", strings.NewReader(propfindBody), int64(len(propfindBody)), depth)
 	}
 	return resp, nil
 }
@@ -365,6 +375,37 @@ func (b *Backend) Stat(rel string) (storage.FileInfo, error) {
 		return storage.FileInfo{}, fmt.Errorf("解析 WebDAV PROPFIND 响应失败: %w", err)
 	}
 	return info, nil
+}
+
+// List returns the immediate children of a collection.
+func (b *Backend) List(rel string) ([]storage.FileInfo, error) {
+	p, err := b.resolve(rel)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := b.propfindDepth(p, "1")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusNotFound:
+		return nil, notExist("list", b.LocationForPath(p))
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return nil, b.statusError("PROPFIND", p, resp)
+	case http.StatusMethodNotAllowed:
+		return nil, fmt.Errorf("目标不是 WebDAV 服务（PROPFIND 返回 405）；OpenList/AList 的 WebDAV 地址通常带 /dav: %s", b.LocationForPath(p))
+	}
+	if resp.StatusCode != http.StatusMultiStatus && (resp.StatusCode < 200 || resp.StatusCode >= 300) {
+		return nil, b.statusError("PROPFIND", p, resp)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxPropfindBody))
+	if err != nil {
+		return nil, fmt.Errorf("读取 WebDAV PROPFIND 响应失败: %w", err)
+	}
+	return parseList(body, p)
 }
 
 var errPropNotFound = errors.New("WebDAV 资源不存在")
@@ -437,6 +478,50 @@ func parseFileInfo(body []byte, p string) (storage.FileInfo, error) {
 		return storage.FileInfo{}, errPropNotFound
 	}
 	return storage.FileInfo{}, errors.New("响应中没有成功的属性")
+}
+
+// parseList turns a Depth: 1 multistatus response into immediate children.
+func parseList(body []byte, basePath string) ([]storage.FileInfo, error) {
+	var ms multistatus
+	if err := xml.Unmarshal(body, &ms); err != nil {
+		return nil, err
+	}
+	base := strings.TrimSuffix(basePath, "/")
+	var out []storage.FileInfo
+	for _, response := range ms.Responses {
+		href := strings.TrimSpace(response.Href)
+		if u, err := url.Parse(href); err == nil && u.Path != "" {
+			href = u.Path
+		}
+		href = strings.TrimSuffix(href, "/")
+		if href == "" || href == base {
+			continue
+		}
+		for _, ps := range response.Propstats {
+			if !statusIsOK(ps.Status) {
+				continue
+			}
+			info := storage.FileInfo{
+				Name:  path.Base(href),
+				IsDir: ps.Prop.ResourceType.Collection != nil,
+			}
+			if props := strings.TrimSpace(ps.Prop.ContentLength); props != "" {
+				size, err := strconv.ParseInt(props, 10, 64)
+				if err != nil {
+					return nil, fmt.Errorf("无效的 getcontentlength %q", props)
+				}
+				info.Size = size
+			}
+			if lm := strings.TrimSpace(ps.Prop.LastModified); lm != "" {
+				if t, err := http.ParseTime(lm); err == nil {
+					info.ModTime = t
+				}
+			}
+			out = append(out, info)
+			break
+		}
+	}
+	return out, nil
 }
 
 func statusCode(status string) int {
@@ -688,6 +773,14 @@ func (b *Backend) Close() error {
 	return nil
 }
 
+// Reconnect drops idle HTTP connections so the next request dials again.
+func (b *Backend) Reconnect() error {
+	if b.http != nil {
+		b.http.CloseIdleConnections()
+	}
+	return nil
+}
+
 func (b *Backend) resolve(rel string) (string, error) {
 	clean, err := storage.CleanRel(rel)
 	if err != nil {
@@ -708,7 +801,7 @@ func (b *Backend) LocationForPath(p string) string {
 }
 
 func (b *Backend) newRequest(method, p string, body io.Reader, contentLength int64) (*http.Request, error) {
-	req, err := http.NewRequestWithContext(context.Background(), method, b.urlFor(p), body)
+	req, err := http.NewRequestWithContext(b.ctx, method, b.urlFor(p), body)
 	if err != nil {
 		return nil, err
 	}
@@ -723,12 +816,16 @@ func (b *Backend) newRequest(method, p string, body io.Reader, contentLength int
 }
 
 func (b *Backend) do(method, p string, body io.Reader, contentLength int64) (*http.Response, error) {
+	return b.doDepth(method, p, body, contentLength, "0")
+}
+
+func (b *Backend) doDepth(method, p string, body io.Reader, contentLength int64, depth string) (*http.Response, error) {
 	req, err := b.newRequest(method, p, body, contentLength)
 	if err != nil {
 		return nil, err
 	}
 	if method == methodPROPFIND {
-		req.Header.Set("Depth", "0")
+		req.Header.Set("Depth", depth)
 		req.Header.Set("Content-Type", "application/xml; charset=utf-8")
 	}
 	return b.http.Do(req)

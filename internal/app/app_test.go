@@ -965,6 +965,106 @@ func TestRunNoVerifyRejectsRecheck(t *testing.T) {
 	}
 }
 
+func TestRunConcurrentUploadsAllFiles(t *testing.T) {
+	src := t.TempDir()
+	dst := filepath.Join(t.TempDir(), "target")
+	for _, name := range []string{"a.zip", "b.zip", "c.zip", "d.zip", "e.zip", "f.zip"} {
+		writeSourceFile(t, src, name, "content-"+name)
+	}
+
+	opts := testOptions(src, dst)
+	opts.Concurrency = 3
+	res, err := Run(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Uploaded != 6 || res.Failed != 0 {
+		t.Fatalf("result: %+v", res)
+	}
+	for _, name := range []string{"a.zip", "b.zip", "c.zip", "d.zip", "e.zip", "f.zip"} {
+		if got := readFile(t, filepath.Join(dst, name)); got != "content-"+name {
+			t.Errorf("%s content = %q", name, got)
+		}
+		if exists(filepath.Join(src, name)) {
+			t.Errorf("%s source should be deleted", name)
+		}
+	}
+}
+
+func TestRunVerifyOnlyChecksAndDoesNotDelete(t *testing.T) {
+	src := t.TempDir()
+	dst := filepath.Join(t.TempDir(), "target")
+	writeSourceFile(t, src, "a/z.7z", "archive-z")
+
+	opts := testOptions(src, dst)
+	opts.KeepSource = true
+	if res, err := Run(context.Background(), opts); err != nil || res.Uploaded != 1 {
+		t.Fatalf("upload run: res=%+v err=%v", res, err)
+	}
+
+	opts.VerifyOnly = true
+	opts.KeepSource = false
+	res, err := Run(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("verify run: %v", err)
+	}
+	if res.Verified != 1 || res.Failed != 0 || res.Uploaded != 0 {
+		t.Fatalf("verify result: %+v", res)
+	}
+	if !exists(filepath.Join(src, "a", "z.7z")) {
+		t.Error("verify-only must not delete the source")
+	}
+
+	// Same size, different content: only a real hash comparison catches it.
+	if err := os.WriteFile(filepath.Join(dst, "a", "z.7z"), []byte("corrupt-z"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, err = Run(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("corrupt verify run: %v", err)
+	}
+	if res.Verified != 0 || res.Failed != 1 {
+		t.Fatalf("corrupt verify result: %+v", res)
+	}
+	if !exists(filepath.Join(src, "a", "z.7z")) {
+		t.Error("verify-only must keep the source after a mismatch")
+	}
+	if got := readFile(t, filepath.Join(dst, "a", "z.7z")); got != "corrupt-z" {
+		t.Errorf("verify-only must not change the remote copy: %q", got)
+	}
+}
+
+func TestRunCleanTempRemovesOnlyToolFiles(t *testing.T) {
+	src := t.TempDir()
+	dst := filepath.Join(t.TempDir(), "target")
+	writeSourceFile(t, dst, "real.zip", "keep")
+	writeSourceFile(t, dst, "real.zip.txt", "keep record")
+	writeSourceFile(t, dst, "a.zip.nassync.tmp", "stale")
+	writeSourceFile(t, dst, "b.zip.nassync.123.abcdef.tmp", "stale")
+	writeSourceFile(t, dst, "sub/c.zip.nassync.456.123456.tmp", "stale")
+	writeSourceFile(t, dst, "keep.nassync.bak", "keep backup")
+
+	opts := testOptions(src, dst)
+	opts.CleanTemp = true
+	res, err := Run(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.RemovedTmp != 3 {
+		t.Fatalf("removed = %d, want 3", res.RemovedTmp)
+	}
+	for _, name := range []string{"a.zip.nassync.tmp", "b.zip.nassync.123.abcdef.tmp", "sub/c.zip.nassync.456.123456.tmp"} {
+		if exists(filepath.Join(dst, filepath.FromSlash(name))) {
+			t.Errorf("%s should be removed", name)
+		}
+	}
+	for _, name := range []string{"real.zip", "real.zip.txt", "keep.nassync.bak"} {
+		if !exists(filepath.Join(dst, filepath.FromSlash(name))) {
+			t.Errorf("%s should be kept", name)
+		}
+	}
+}
+
 func TestRunPlainLocalTarget(t *testing.T) {
 	src := t.TempDir()
 	dst := filepath.Join(t.TempDir(), "backup")

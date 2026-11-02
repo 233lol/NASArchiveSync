@@ -75,6 +75,48 @@ func (b *Backend) Open(rel string) (io.ReadCloser, error) {
 	return os.Open(p)
 }
 
+// OpenRange reads length bytes starting at offset.
+func (b *Backend) OpenRange(rel string, offset, length int64) (io.ReadCloser, error) {
+	if offset < 0 || length <= 0 {
+		return nil, fmt.Errorf("无效的本地读取范围: offset=%d length=%d", offset, length)
+	}
+	p, err := b.path(rel)
+	if err != nil {
+		return nil, err
+	}
+	f, err := os.Open(p)
+	if err != nil {
+		return nil, err
+	}
+	return storage.NewRangeReadCloser(f, offset, length, f), nil
+}
+
+// List returns the immediate children of a local directory.
+func (b *Backend) List(rel string) ([]storage.FileInfo, error) {
+	p, err := b.path(rel)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(p)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]storage.FileInfo, 0, len(entries))
+	for _, entry := range entries {
+		info, err := entry.Info()
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, storage.FileInfo{
+			Name:    info.Name(),
+			Size:    info.Size(),
+			IsDir:   info.IsDir(),
+			ModTime: info.ModTime(),
+		})
+	}
+	return out, nil
+}
+
 func (b *Backend) Create(rel string) (storage.Writer, error) {
 	p, err := b.path(rel)
 	if err != nil {

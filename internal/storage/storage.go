@@ -4,6 +4,7 @@
 package storage
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -44,11 +45,49 @@ type RangeReader interface {
 	OpenRange(rel string, offset, length int64) (io.ReadCloser, error)
 }
 
+// RangeReadCloser adapts an io.ReaderAt to a byte-range ReadCloser.
+type RangeReadCloser struct {
+	*io.SectionReader
+	closer io.Closer
+}
+
+// NewRangeReadCloser returns a reader for length bytes starting at offset. The
+// closer is closed by Close.
+func NewRangeReadCloser(r io.ReaderAt, offset, length int64, closer io.Closer) *RangeReadCloser {
+	return &RangeReadCloser{
+		SectionReader: io.NewSectionReader(r, offset, length),
+		closer:        closer,
+	}
+}
+
+func (r *RangeReadCloser) Close() error {
+	return r.closer.Close()
+}
+
 // RenameReplacer is implemented by backends whose Rename can atomically replace
 // an existing destination. Callers must keep the old file until the rename
 // succeeds on backends that do not implement it.
 type RenameReplacer interface {
 	RenameReplaces() bool
+}
+
+// Reconnector is implemented by backends that can rebuild a broken session in
+// place. The retry loop calls it before retrying a transient failure.
+type Reconnector interface {
+	Reconnect() error
+}
+
+// AtomicCreator is implemented by object stores whose Create makes the final
+// object visible only after a successful Close. Such backends can skip the
+// temporary-key + copy step when no previous object has to be preserved.
+type AtomicCreator interface {
+	CreateAtomic(rel string) (Writer, error)
+}
+
+// Lister lists the immediate children of a remote directory. Audit and
+// temporary-file cleanup use it.
+type Lister interface {
+	List(rel string) ([]FileInfo, error)
 }
 
 // Backend abstracts a remote directory tree. All paths are slash separated and
@@ -76,6 +115,9 @@ type Options struct {
 	Domain   string
 	Port     int
 	Timeout  time.Duration
+	// Context cancels in-flight HTTP requests. Backends without request-level
+	// cancellation still use Timeout for connection setup.
+	Context context.Context
 	// CreateRoot asks the backend to create the target root when missing. It is
 	// false for dry runs so that a preview never changes the remote side.
 	CreateRoot bool

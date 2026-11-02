@@ -14,10 +14,11 @@
 - 支持 S3 兼容对象存储（Garage、MinIO、Ceph RGW、AWS S3），可选路径模式或虚拟主机/域名模式
 - 支持 WebDAV（`webdav://`、`webdavs://`、`dav://`、`davs://`，也接受 `http://`/`https://`），支持 Basic 认证，兼容 OpenList/AList、Nextcloud、Apache mod_dav 等
 - WebDAV 校验同样支持 Range 并发读取；服务器忽略 Range 时可用 `--verify-concurrency 1` 顺序校验
+- SFTP、SMB 和本地目标也支持 Range 并发校验；哈希仍严格按字节顺序计算，结果与顺序读取完全一致
 - SFTP 可选加密算法，默认 `aes128-gcm@openssh.com`（实测与 AES-256-GCM 并列最快且 CPU 更低），也可用 `--sftp-cipher` 指定
 - 上传时顺带计算本地 SHA256（`io.TeeReader`），新文件只读一遍本地磁盘
 - 上传后从 NAS 读回文件重新计算 SHA256，与本地比对
-- S3/WebDAV 校验默认用 4 路 Range 并发读取（`--verify-concurrency`），哈希仍严格按字节顺序计算，结果与顺序读取完全一致
+- S3 新文件直接原子写入最终 key，不再额外复制一次临时对象
 - 可选用 `--no-verify` 完全关闭校验：不计算 SHA256、上传后不读回远端，记录标记为未校验
 - 校验一致后按 `--txt` 写入 `压缩包名.txt`（如 `z.7z.txt`）：默认 NAS 与本地各一份，也可只留一边或完全不生成
 - 记录写入成功后才删除本地压缩包；本地 txt 记录会保留，任何失败都保留本地文件
@@ -25,6 +26,11 @@
 - `--dry-run` 演练
 - `--list` 只列出匹配到的归档文件，可省略目标路径，适合检查 include/exclude 规则
 - 默认开启上传/校验流水线：上传下一个文件的同时，用独立 SMB/SFTP 会话校验上一个文件（`--no-pipeline` 可关闭）
+- `--concurrency N` 可同时处理多个文件，每个 worker 使用独立连接；适合大量小文件
+- 瞬时网络错误自动重试并重建 SMB/SFTP 会话（`--retries`、`--retry-delay`）
+- `--verify-only` 只审计已有远端文件，不上传、不写记录、不删除
+- `--clean-temp` 递归清理本工具遗留的临时文件
+- `--limit` 限制上传/校验总带宽，避免占满网络
 - 流水线模式显示两行动态进度（上传 / 校验），日志自动让位，不会打乱进度区域；终端不支持 ANSI 时自动退回普通日志
 - 进度显示百分比、已传/总大小、实时速度、ETA；按终端宽度和中文显示宽度自适应，不会因长文件名换行
 - 幂等：重复运行时已上传且校验一致的文件自动跳过
@@ -410,7 +416,14 @@ $env:NAS_S3_SECRET_KEY = "你的 Secret Access Key"
 | `--keep-source` | 上传成功后保留本地压缩包 |
 | `--force` | 目标已存在且内容不一致时覆盖 |
 | `--recheck` | 跳过已上传文件时重新读回远端校验 SHA256 |
-| `--verify-concurrency N` | 远端校验的并发读连接数，默认 `4`，`1` 表示顺序读取；后端支持 Range 时生效（S3、WebDAV），范围为 1-16 |
+| `--verify-concurrency N` | 远端校验的并发读连接数，默认 `4`，`1` 表示顺序读取；S3、WebDAV、SFTP、SMB、本地目标支持 Range，范围为 1-16 |
+| `--concurrency N` | 同时处理的文件数，默认 `1`，最大 `16`；大于 1 时关闭流水线，每个 worker 使用独立会话 |
+| `--verify-only` | 只校验已有远端文件，不上传、不写记录、不删除；不能与 `--no-verify` / `--dry-run` 同用 |
+| `--clean-temp` | 递归清理目标目录下本工具遗留的临时文件，清理后退出（可配合 `--verify-only` 先清理再校验） |
+| `--timeout SEC` | 连接/握手超时，默认 `30` 秒 |
+| `--retries N` | 瞬时网络错误重试次数，默认 `3`，`0` 表示不重试 |
+| `--retry-delay SEC` | 首次重试等待，默认 `1` 秒，之后指数退避，最长 30 秒 |
+| `--limit MIB` | 上传和远端校验的总带宽上限（MiB/s），默认 `0` 表示不限 |
 | `--case-sensitive` | 包含/排除模式区分大小写（默认不区分） |
 | `--smb-user NAME` | SMB 用户名，留空为匿名；支持 `DOMAIN\user` 写法 |
 | `--smb-pass PASS` | SMB 密码（建议使用环境变量） |
@@ -643,6 +656,34 @@ SHA256: 未计算
 .\NASArchiveSync.exe -s "C:\game" -t "\\192.168.12.1\mnt\hdd1\game" --depth 1 --no-verify --force
 ```
 
+## 可靠性、并发与限速
+
+```powershell
+# 网络不稳定时重试 5 次，首次等待 2 秒（之后指数退避）
+.\NASArchiveSync.exe -s "C:\game" -t "\\192.168.12.1\mnt\hdd1\game" --retries 5 --retry-delay 2
+
+# 同时处理 4 个文件（每个 worker 使用独立会话）
+.\NASArchiveSync.exe -s "C:\game" -t "s3://oss/game" --concurrency 4
+
+# 上传/校验总带宽限制为 50 MiB/s
+.\NASArchiveSync.exe -s "C:\game" -t "\\192.168.12.1\mnt\hdd1\game" --limit 50
+
+# 只审计：检查远端是否与本地一致，不上传、不写记录、不删除
+.\NASArchiveSync.exe -s "C:\game" -t "\\192.168.12.1\mnt\hdd1\game" --verify-only
+
+# 清理本工具遗留的临时文件（不会删除正式压缩包、txt 或 .bak 备份）
+# 清理后退出；可与 --verify-only 组合，先清理再校验
+.\NASArchiveSync.exe -s "C:\game" -t "\\192.168.12.1\mnt\hdd1\game" --clean-temp
+```
+
+说明：
+
+- 只有可恢复的网络错误才会重试；认证失败、路径冲突、参数错误不会重试。重试前会尝试重建 SMB/SFTP 会话。
+- `--concurrency 1`（默认）使用“上传下一个 / 校验上一个”的流水线；大于 1 时关闭流水线，改为多个 worker 各自上传并校验。并发越高，连接数和内存占用越大。
+- `--limit` 使用共享令牌桶，上传和远端校验共用同一份带宽预算；本地哈希不受限。
+- `--verify-only` 始终完整读取远端并计算 SHA256，不依赖记录直接跳过。
+- `--clean-temp` 只识别本工具生成的 `.nassync.*.tmp` 和旧的 `.nassync.tmp`；`.bak` 备份会保留，便于人工恢复。
+
 ## 行为与安全说明
 
 - **流水线（默认）**：上传第 N+1 个文件的同时，用另一个 SMB/SFTP 会话校验第 N 个文件；两者互不阻塞，适合多个大文件。校验仍是完整读回 + SHA256。加 `--no-pipeline` 可恢复逐文件顺序处理；`--no-verify` 下没有校验步骤，自动按顺序上传。
@@ -672,6 +713,9 @@ SHA256: 未计算
 
 - **本地只读一遍**：新文件在上传时计算 SHA256；旧流程是“先读本地算哈希，再读本地上传”，现在少一次本地全量读取。
 - **流水线重叠**：上传与校验使用两个独立的 SMB/SFTP 会话，队列长度为 1。上传第 N+1 个文件时，第 N 个文件正在读回校验；校验失败只删除对应远端文件并保留本地文件，其余文件继续处理。
+- **并发多文件**：`--concurrency N` 会为每个 worker 打开独立后端会话。N 个文件同时上传时峰值内存和连接数约为单文件的 N 倍，建议从 2–4 开始，确认 NAS 和网络承受能力后再提高。
+- **Range 校验覆盖所有后端**：S3、WebDAV、SFTP、SMB、本地和系统级 SMB 都实现 `RangeReader`；大文件会按 16 MiB 分块并发读取，再由单一协程按顺序计算 SHA256。
+- **S3 直接原子写**：新对象直接 `PutObject` / `CompleteMultipartUpload` 到最终 key，不再先写临时 key 再 `CopyObject`；覆盖已有对象时仍走临时对象，以保留旧版本直到新内容完整。
 - **复制缓冲区**：默认 2 MiB（源码中的 `maxCopyBufferSize`）。在 `\\192.168.12.1\mnt\hdd1\game\test` 上用 3 个 512 MiB 文件实测，512 KiB / 1 MiB 约 8.6–8.9s，2 MiB / 4 MiB 约 7.8–8.2s，再往上收益不明显。该值针对大文件；小于缓冲区的文件会按实际大小分配。
 - **实测流水线收益**：同一组 3×512 MiB 文件，顺序模式约 7.7–8.4s，流水线约 7.5s；当校验读取相对上传更慢时收益更明显。流水线不改变校验强度，仍是完整 SHA256 读回。
 - **关闭校验的收益**：`--no-verify` 省掉本地 SHA256 计算和一次完整的远端读回，网络流量减半、耗时最短；代价是无法发现传输或存储损坏。
@@ -758,6 +802,9 @@ type Backend interface {
 - `RangeReader`：支持任意字节范围读取，大文件可用 `--verify-concurrency` 并行校验。
 - `SizedWriter`：在写入前告知总大小，便于后端选择分片或 Content-Length。
 - `RenameReplacer`：声明 `Rename` 能否原子替换已有目标；不能替换的后端会由工具先备份旧文件再重命名。
+- `Reconnector`：瞬时网络错误后重建会话，供重试使用。
+- `AtomicCreator`：对象存储可直接写最终 key，并保证 Close 成功前对象不可见。
+- `Lister`：列出目录，用于 `--clean-temp` 和审计功能。
 
 新增协议只需：
 
@@ -777,7 +824,7 @@ go vet ./...
 
 仓库的 GitHub Actions（`.github/workflows/ci.yml`）会在 Linux 和 Windows 上执行格式检查、`go vet`、单元测试和构建，Linux 上另外运行一次 race 检测。
 
-端到端测试使用 `local:` 后端，覆盖上传、校验、记录、删源、dry-run、层数、幂等、冲突、强制覆盖、远端损坏检测，以及 `--no-verify` 的上传、按记录跳过、冲突和强制覆盖。
+端到端测试使用 `local:` 后端，覆盖上传、校验、记录、删源、dry-run、层数、幂等、冲突、强制覆盖、远端损坏检测、`--no-verify`、`--concurrency`、`--verify-only`、`--clean-temp`，以及范围读取、重试和 S3 直接原子写入。
 
 SFTP 相关单元测试覆盖目标地址解析、加密算法选择、known_hosts 损坏行容错和主机密钥重试判断。
 S3 相关单元测试覆盖目标地址解析、auto 模式选择、endpoint 规范化、CopySource 转义，以及

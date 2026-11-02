@@ -48,6 +48,7 @@ const (
 type Backend struct {
 	client      *awss3.Client
 	httpClient  *http.Client
+	ctx         context.Context
 	bucket      string
 	prefix      string
 	style       string
@@ -120,7 +121,11 @@ func openWithHTTPClient(t storage.Target, opt storage.Options, httpClient *http.
 	}
 	loadOpts = append(loadOpts, awsconfig.WithHTTPClient(httpClient))
 
-	cfg, err := awsconfig.LoadDefaultConfig(context.Background(), loadOpts...)
+	baseCtx := opt.Context
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+	cfg, err := awsconfig.LoadDefaultConfig(baseCtx, loadOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("加载 S3 配置失败: %w", err)
 	}
@@ -140,7 +145,7 @@ func openWithHTTPClient(t storage.Target, opt storage.Options, httpClient *http.
 	if timeout <= 0 {
 		timeout = defaultTimeout
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(baseCtx, timeout)
 	defer cancel()
 	if _, err := client.HeadBucket(ctx, &awss3.HeadBucketInput{Bucket: aws.String(t.Bucket)}); err != nil {
 		if isNotFound(err) {
@@ -162,6 +167,7 @@ func openWithHTTPClient(t storage.Target, opt storage.Options, httpClient *http.
 	return &Backend{
 		client:      client,
 		httpClient:  idleCloser,
+		ctx:         baseCtx,
 		bucket:      t.Bucket,
 		prefix:      cleanPrefix(t.Path),
 		style:       style,
@@ -303,7 +309,7 @@ func (b *Backend) Stat(rel string) (storage.FileInfo, error) {
 		return storage.FileInfo{Name: b.bucket, IsDir: true}, nil
 	}
 
-	ctx := context.Background()
+	ctx := b.ctx
 	out, err := b.client.HeadObject(ctx, &awss3.HeadObjectInput{
 		Bucket: aws.String(b.bucket),
 		Key:    aws.String(key),
@@ -335,6 +341,62 @@ func (b *Backend) Stat(rel string) (storage.FileInfo, error) {
 	return storage.FileInfo{}, os.ErrNotExist
 }
 
+// List returns the immediate children of a key prefix.
+func (b *Backend) List(rel string) ([]storage.FileInfo, error) {
+	dirKey, err := b.resolve(rel)
+	if err != nil {
+		return nil, err
+	}
+	listPrefix := dirKey
+	if listPrefix != "" {
+		listPrefix += "/"
+	}
+
+	var out []storage.FileInfo
+	var token *string
+	for {
+		page, err := b.client.ListObjectsV2(b.ctx, &awss3.ListObjectsV2Input{
+			Bucket:            aws.String(b.bucket),
+			Prefix:            aws.String(listPrefix),
+			Delimiter:         aws.String("/"),
+			ContinuationToken: token,
+		})
+		if err != nil {
+			return nil, err
+		}
+		for _, prefix := range page.CommonPrefixes {
+			name := strings.TrimSuffix(strings.TrimPrefix(aws.ToString(prefix.Prefix), listPrefix), "/")
+			if name == "" {
+				continue
+			}
+			out = append(out, storage.FileInfo{Name: name, IsDir: true})
+		}
+		for _, object := range page.Contents {
+			key := aws.ToString(object.Key)
+			if key == listPrefix {
+				continue
+			}
+			name := strings.TrimPrefix(key, listPrefix)
+			if name == "" || strings.Contains(name, "/") {
+				continue
+			}
+			out = append(out, storage.FileInfo{
+				Name:    name,
+				Size:    aws.ToInt64(object.Size),
+				ModTime: aws.ToTime(object.LastModified),
+			})
+		}
+		if !aws.ToBool(page.IsTruncated) {
+			break
+		}
+		token = page.NextContinuationToken
+		if token == nil || *token == "" {
+			break
+		}
+	}
+	return out, nil
+}
+
 func (b *Backend) Open(rel string) (io.ReadCloser, error) {
 	key, err := b.resolve(rel)
 	if err != nil {
@@ -343,7 +405,7 @@ func (b *Backend) Open(rel string) (io.ReadCloser, error) {
 	if key == "" {
 		return nil, fmt.Errorf("%w: %s", os.ErrNotExist, b.Root())
 	}
-	out, err := b.client.GetObject(context.Background(), &awss3.GetObjectInput{
+	out, err := b.client.GetObject(b.ctx, &awss3.GetObjectInput{
 		Bucket: aws.String(b.bucket),
 		Key:    aws.String(key),
 	})
@@ -371,7 +433,7 @@ func (b *Backend) OpenRange(rel string, offset, length int64) (io.ReadCloser, er
 	if key == "" {
 		return nil, fmt.Errorf("%w: %s", os.ErrNotExist, b.Root())
 	}
-	out, err := b.client.GetObject(context.Background(), &awss3.GetObjectInput{
+	out, err := b.client.GetObject(b.ctx, &awss3.GetObjectInput{
 		Bucket: aws.String(b.bucket),
 		Key:    aws.String(key),
 		Range:  aws.String(fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)),
@@ -391,6 +453,17 @@ func (b *Backend) OpenRange(rel string, offset, length int64) (io.ReadCloser, er
 }
 
 func (b *Backend) Create(rel string) (storage.Writer, error) {
+	return b.create(rel)
+}
+
+// CreateAtomic writes the final key directly. PutObject and
+// CompleteMultipartUpload only expose the object after a successful Close, so
+// no temporary-key copy is needed.
+func (b *Backend) CreateAtomic(rel string) (storage.Writer, error) {
+	return b.create(rel)
+}
+
+func (b *Backend) create(rel string) (storage.Writer, error) {
 	if rel == "" {
 		return nil, errors.New("拒绝写入 bucket 根对象")
 	}
@@ -401,7 +474,7 @@ func (b *Backend) Create(rel string) (storage.Writer, error) {
 	if key == "" {
 		return nil, errors.New("拒绝写入 bucket 根对象")
 	}
-	return newWriter(b.client, b.bucket, key, b.partSize, b.concurrency, b.pool), nil
+	return newWriter(b.ctx, b.client, b.bucket, key, b.partSize, b.concurrency, b.pool), nil
 }
 
 func (b *Backend) Remove(rel string) error {
@@ -415,7 +488,7 @@ func (b *Backend) Remove(rel string) error {
 	if key == "" {
 		return errors.New("拒绝删除 bucket 根")
 	}
-	_, err = b.client.DeleteObject(context.Background(), &awss3.DeleteObjectInput{
+	_, err = b.client.DeleteObject(b.ctx, &awss3.DeleteObjectInput{
 		Bucket: aws.String(b.bucket),
 		Key:    aws.String(key),
 	})
@@ -443,7 +516,7 @@ func (b *Backend) Rename(oldRel, newRel string) error {
 		return errors.New("拒绝在 bucket 根上重命名")
 	}
 
-	ctx := context.Background()
+	ctx := b.ctx
 	head, err := b.client.HeadObject(ctx, &awss3.HeadObjectInput{
 		Bucket: aws.String(b.bucket),
 		Key:    aws.String(oldKey),
@@ -485,7 +558,7 @@ func (b *Backend) multipartCopy(ctx context.Context, srcKey, dstKey string, head
 	}
 	uploadID := aws.ToString(create.UploadId)
 	abort := func() {
-		_, _ = b.client.AbortMultipartUpload(context.Background(), &awss3.AbortMultipartUploadInput{
+		_, _ = b.client.AbortMultipartUpload(b.ctx, &awss3.AbortMultipartUploadInput{
 			Bucket:   aws.String(b.bucket),
 			Key:      aws.String(dstKey),
 			UploadId: aws.String(uploadID),
@@ -544,6 +617,14 @@ func (b *Backend) Close() error {
 	return nil
 }
 
+// Reconnect drops idle HTTP connections so the next request dials again.
+func (b *Backend) Reconnect() error {
+	if b.httpClient != nil {
+		b.httpClient.CloseIdleConnections()
+	}
+	return nil
+}
+
 func (b *Backend) resolve(rel string) (string, error) {
 	clean, err := storage.CleanRel(rel)
 	if err != nil {
@@ -590,6 +671,7 @@ func isNotFound(err error) bool {
 }
 
 type writer struct {
+	ctx         context.Context
 	client      *awss3.Client
 	bucket      string
 	key         string
@@ -614,7 +696,7 @@ type writer struct {
 	abortOnce sync.Once
 }
 
-func newWriter(client *awss3.Client, bucket, key string, partSize, concurrency int, pool *bufferPool) *writer {
+func newWriter(ctx context.Context, client *awss3.Client, bucket, key string, partSize, concurrency int, pool *bufferPool) *writer {
 	if partSize < minPartSize {
 		partSize = minPartSize
 	}
@@ -625,6 +707,7 @@ func newWriter(client *awss3.Client, bucket, key string, partSize, concurrency i
 		pool = newBufferPool(concurrency+1, partSize)
 	}
 	return &writer{
+		ctx:         ctx,
 		client:      client,
 		bucket:      bucket,
 		key:         key,
@@ -726,7 +809,7 @@ func (w *writer) Close() error {
 		return err
 	}
 
-	ctx := context.Background()
+	ctx := w.ctx
 	if w.uploadID == "" {
 		// Small object: a single PutObject is cheaper than multipart.
 		_, err := w.client.PutObject(ctx, &awss3.PutObjectInput{
@@ -795,7 +878,7 @@ func (w *writer) dispatchPart(refill bool) error {
 
 	w.mu.Lock()
 	if w.uploadID == "" {
-		out, err := w.client.CreateMultipartUpload(context.Background(), &awss3.CreateMultipartUploadInput{
+		out, err := w.client.CreateMultipartUpload(w.ctx, &awss3.CreateMultipartUploadInput{
 			Bucket: aws.String(w.bucket),
 			Key:    aws.String(w.key),
 		})
@@ -827,7 +910,7 @@ func (w *writer) dispatchPart(refill bool) error {
 			w.putBuffer(buf)
 		}()
 
-		out, err := w.client.UploadPart(context.Background(), &awss3.UploadPartInput{
+		out, err := w.client.UploadPart(w.ctx, &awss3.UploadPartInput{
 			Bucket:        aws.String(w.bucket),
 			Key:           aws.String(w.key),
 			UploadId:      aws.String(uploadID),
@@ -945,7 +1028,10 @@ func (w *writer) abort() {
 		return
 	}
 	w.abortOnce.Do(func() {
-		_, _ = w.client.AbortMultipartUpload(context.Background(), &awss3.AbortMultipartUploadInput{
+		// Cleanup must still run after the run context was cancelled.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_, _ = w.client.AbortMultipartUpload(ctx, &awss3.AbortMultipartUploadInput{
 			Bucket:   aws.String(w.bucket),
 			Key:      aws.String(w.key),
 			UploadId: aws.String(uploadID),

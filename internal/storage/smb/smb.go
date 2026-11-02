@@ -23,6 +23,8 @@ type Backend struct {
 	host    string
 	shareTo string
 	root    string
+	target  storage.Target
+	opt     storage.Options
 }
 
 // Open connects to the SMB share described by t, authenticates and optionally
@@ -86,6 +88,8 @@ func Open(t storage.Target, opt storage.Options) (storage.Backend, error) {
 		host:    t.Host,
 		shareTo: t.Share,
 		root:    strings.Trim(t.Path, "/"),
+		target:  t,
+		opt:     opt,
 	}
 
 	if opt.CreateRoot && b.root != "" {
@@ -160,6 +164,45 @@ func (b *Backend) Open(rel string) (io.ReadCloser, error) {
 	return b.share.Open(p)
 }
 
+// OpenRange opens a fresh handle and reads a byte range from it, which lets the
+// verifier fetch large files over several connections.
+func (b *Backend) OpenRange(rel string, offset, length int64) (io.ReadCloser, error) {
+	if offset < 0 || length <= 0 {
+		return nil, fmt.Errorf("无效的 SMB 读取范围: offset=%d length=%d", offset, length)
+	}
+	p, err := b.resolve(rel)
+	if err != nil {
+		return nil, err
+	}
+	f, err := b.share.Open(p)
+	if err != nil {
+		return nil, err
+	}
+	return storage.NewRangeReadCloser(f, offset, length, f), nil
+}
+
+// List returns the immediate children of a shared directory.
+func (b *Backend) List(rel string) ([]storage.FileInfo, error) {
+	p, err := b.resolve(rel)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := b.share.ReadDir(p)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]storage.FileInfo, 0, len(entries))
+	for _, info := range entries {
+		out = append(out, storage.FileInfo{
+			Name:    info.Name(),
+			Size:    info.Size(),
+			IsDir:   info.IsDir(),
+			ModTime: info.ModTime(),
+		})
+	}
+	return out, nil
+}
+
 func (b *Backend) Create(rel string) (storage.Writer, error) {
 	p, err := b.resolve(rel)
 	if err != nil {
@@ -212,6 +255,26 @@ func (b *Backend) Close() error {
 		b.conn = nil
 	}
 	return firstErr
+}
+
+// Reconnect rebuilds the SMB session after a transient network failure.
+func (b *Backend) Reconnect() error {
+	target, opt := b.target, b.opt
+	_ = b.Close()
+	next, err := Open(target, opt)
+	if err != nil {
+		return err
+	}
+	other, ok := next.(*Backend)
+	if !ok {
+		_ = next.Close()
+		return errors.New("SMB 重连返回了意外的后端类型")
+	}
+	b.conn, b.session, b.share = other.conn, other.session, other.share
+	b.host, b.shareTo, b.root = other.host, other.shareTo, other.root
+	b.target, b.opt = other.target, other.opt
+	other.conn, other.session, other.share = nil, nil, nil
+	return nil
 }
 
 func (b *Backend) resolve(rel string) (string, error) {
