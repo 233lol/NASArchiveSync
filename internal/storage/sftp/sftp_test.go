@@ -41,6 +41,14 @@ func TestCipherList(t *testing.T) {
 	}
 }
 
+func TestRenameReplacesRequiresPosixRenameExtension(t *testing.T) {
+	// A backend without a live SFTP client cannot know whether the server
+	// advertises posix-rename@openssh.com, so it must not claim to replace.
+	if (&Backend{}).RenameReplaces() {
+		t.Fatal("RenameReplaces must be false without an SFTP client")
+	}
+}
+
 func TestCleanRoot(t *testing.T) {
 	tests := map[string]string{
 		"":                 "/",

@@ -225,10 +225,24 @@ func cleanRoot(p string) string {
 
 func (b *Backend) Kind() string { return "sftp" }
 
-// RenameReplaces reports that posix-rename@openssh.com atomically replaces the
-// destination. Servers without the extension fail the rename, which keeps the
-// old file intact rather than losing it.
-func (b *Backend) RenameReplaces() bool { return true }
+// posixRenameExtension is the OpenSSH extension that makes rename replace an
+// existing destination. Plain SFTP v3 rename must fail when the destination
+// exists, so callers have to back the old file up first on servers without it.
+const posixRenameExtension = "posix-rename@openssh.com"
+
+// RenameReplaces reports whether rename atomically replaces the destination.
+// It is only true when the server advertises posix-rename@openssh.com.
+func (b *Backend) RenameReplaces() bool {
+	return b.hasPosixRename()
+}
+
+func (b *Backend) hasPosixRename() bool {
+	if b.client == nil {
+		return false
+	}
+	_, ok := b.client.HasExtension(posixRenameExtension)
+	return ok
+}
 
 // endpoint renders host[:port] for logs. Port 22 is omitted so the common case
 // stays identical to scp notation.
@@ -354,10 +368,11 @@ func (b *Backend) Rename(oldRel, newRel string) error {
 		return err
 	}
 	// posix-rename@openssh.com atomically replaces an existing destination and
-	// is what scp/sftp rely on. Fall back to the plain SFTP v3 rename for
-	// servers that do not advertise the extension.
-	if err := b.client.PosixRename(oldPath, newPath); err == nil {
-		return nil
+	// is what scp/sftp rely on. Plain SFTP v3 rename must not replace anything,
+	// so only use it when the server advertised the extension; otherwise the
+	// caller backs the old file up before renaming.
+	if b.hasPosixRename() {
+		return b.client.PosixRename(oldPath, newPath)
 	}
 	return b.client.Rename(oldPath, newPath)
 }
