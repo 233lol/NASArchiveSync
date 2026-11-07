@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/fjf/NASArchiveSync/internal/humanize"
@@ -15,8 +16,80 @@ import (
 )
 
 // runVerifyOnly checks every local archive against the remote copy. It never
-// uploads, writes records or deletes source files.
-func runVerifyOnly(ctx context.Context, o Options, log *xlog.Logger, backend storage.Backend, files []scan.File, res *Result) {
+// uploads, writes records or deletes source files. With --concurrency > 1 it
+// opens one read-only backend per worker, just like the upload path.
+func runVerifyOnly(ctx context.Context, o Options, log *xlog.Logger, first storage.Backend, open func() (storage.Backend, error), files []scan.File, res *Result) error {
+	workers := o.Concurrency
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > len(files) {
+		workers = len(files)
+	}
+	if workers <= 1 {
+		runVerifyOnlySequential(ctx, o, log, first, files, res)
+		return nil
+	}
+
+	backends := make([]storage.Backend, workers)
+	backends[0] = first
+	for i := 1; i < workers; i++ {
+		backend, err := open()
+		if err != nil {
+			for _, opened := range backends[1:i] {
+				_ = opened.Close()
+			}
+			return err
+		}
+		backends[i] = backend
+	}
+	defer func() {
+		for _, backend := range backends[1:] {
+			_ = backend.Close()
+		}
+	}()
+
+	log.Infof("并发校验: %d 个文件同时处理", workers)
+	jobs := make(chan int)
+	results := make(chan fileResult, len(files))
+	var wg sync.WaitGroup
+	for _, backend := range backends {
+		wg.Add(1)
+		go func(backend storage.Backend) {
+			defer wg.Done()
+			discard := func(string, int64) progress.Counter { return progress.Discard }
+			for index := range jobs {
+				if ctx.Err() != nil {
+					return
+				}
+				file := files[index]
+				log.Infof("[%d/%d] 校验 %s (%s)", index+1, len(files), file.Rel, humanize.Bytes(file.Size))
+				results <- verifyFile(ctx, o, log, backend, file, discard)
+			}
+		}(backend)
+	}
+
+	go func() {
+		defer close(jobs)
+		for index := range files {
+			select {
+			case jobs <- index:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+	for result := range results {
+		aggregateResult(res, result, log)
+	}
+	return nil
+}
+
+func runVerifyOnlySequential(ctx context.Context, o Options, log *xlog.Logger, backend storage.Backend, files []scan.File, res *Result) {
 	counter := func(label string, total int64) progress.Counter {
 		return progress.New(o.ProgressOut, label, total, progressEnabled(o, true))
 	}

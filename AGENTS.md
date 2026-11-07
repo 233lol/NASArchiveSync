@@ -85,8 +85,9 @@ The abstraction is `internal/storage/storage.go` (`Backend`, `Writer`, `SizedWri
   transports); `0` disables it. It covers transfers, not local hashing.
 - `--concurrency > 1` disables the pipeline and requires one backend per worker. Workers must
   not share a `Writer`; they may share the bandwidth limiter, which is mutex-protected.
-- `--verify-only` must never upload, write records or delete. It always hashes both copies and
-  is incompatible with `--no-verify` and `--dry-run`.
+- `--verify-only` must never upload, write records or delete. It always hashes both copies
+  and is incompatible with `--no-verify` and `--dry-run`. `--concurrency > 1` uses one
+  read-only backend per worker, like the upload path.
 - `--clean-temp` may only remove names matching the tool's `.nassync.*.tmp` /
   `.nassync.tmp` convention; never archives, completion notes or `.bak` backups.
 - S3 direct writes (`AtomicCreator`) may only be used when no previous remote object has to be

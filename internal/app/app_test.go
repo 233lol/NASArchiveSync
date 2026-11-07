@@ -991,6 +991,46 @@ func TestRunConcurrentUploadsAllFiles(t *testing.T) {
 	}
 }
 
+func TestRunVerifyOnlyConcurrentChecksAllFiles(t *testing.T) {
+	src := t.TempDir()
+	dst := filepath.Join(t.TempDir(), "target")
+	files := map[string]string{
+		"a.7z": "aaa",
+		"b.7z": "bbb",
+		"c.7z": "ccc",
+	}
+	for rel, content := range files {
+		writeSourceFile(t, src, rel, content)
+	}
+
+	opts := testOptions(src, dst)
+	opts.KeepSource = true
+	if res, err := Run(context.Background(), opts); err != nil || res.Uploaded != 3 {
+		t.Fatalf("upload run: res=%+v err=%v", res, err)
+	}
+
+	// Corrupt one remote copy without changing its size, so only a hash
+	// comparison detects it.
+	if err := os.WriteFile(filepath.Join(dst, "b.7z"), []byte("XXX"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	opts.VerifyOnly = true
+	opts.Concurrency = 3
+	res, err := Run(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("verify run: %v", err)
+	}
+	if res.Verified != 2 || res.Failed != 1 || res.Uploaded != 0 {
+		t.Fatalf("verify result: %+v", res)
+	}
+	for rel := range files {
+		if !exists(filepath.Join(src, rel)) {
+			t.Errorf("verify-only must keep the source %s", rel)
+		}
+	}
+}
+
 func TestRunVerifyOnlyChecksAndDoesNotDelete(t *testing.T) {
 	src := t.TempDir()
 	dst := filepath.Join(t.TempDir(), "target")

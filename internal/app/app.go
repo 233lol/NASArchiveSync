@@ -460,7 +460,9 @@ func Run(ctx context.Context, o Options) (Result, error) {
 		}
 	}
 	if o.VerifyOnly {
-		runVerifyOnly(ctx, o, log, uploadBackend, files, &res)
+		if err := runVerifyOnly(ctx, o, log, uploadBackend, openBackend, files, &res); err != nil {
+			return res, err
+		}
 		res.Duration = time.Since(started)
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			log.Warnf("已中断")
