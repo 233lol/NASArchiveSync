@@ -43,10 +43,13 @@ func Open(t storage.Target, opt storage.Options) (storage.Backend, error) {
 	}
 
 	addr := net.JoinHostPort(t.Host, strconv.Itoa(port))
-	conn, err := net.DialTimeout("tcp", addr, timeout)
+	rawConn, err := net.DialTimeout("tcp", addr, timeout)
 	if err != nil {
 		return nil, fmt.Errorf("连接 SMB 服务器 %s 失败: %w", addr, err)
 	}
+	// Apply the connection timeout during authentication, then switch to the
+	// longer idle limit for transfers.
+	conn := storage.NewIdleTimeoutConn(rawConn, timeout)
 	// Bound the authentication and tree connect phases; long uploads must not be
 	// affected once the deadline is cleared below.
 	_ = conn.SetDeadline(time.Now().Add(timeout))
@@ -80,6 +83,7 @@ func Open(t storage.Target, opt storage.Options) (storage.Backend, error) {
 		return nil, fmt.Errorf("挂载共享 %q 失败: %w", t.Share, err)
 	}
 	_ = conn.SetDeadline(time.Time{})
+	conn.SetIdleTimeout(opt.IOTimeout)
 
 	b := &Backend{
 		conn:    conn,

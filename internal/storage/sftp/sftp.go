@@ -112,7 +112,7 @@ func Open(t storage.Target, opt storage.Options) (storage.Backend, error) {
 	// Ciphers lives on the embedded ssh.Config. Assigning it after the struct
 	// literal keeps the module compatible with go1.26.
 	cfg.Config.Ciphers = ciphers
-	sshClient, err := dialSSH(addr, timeout, cfg)
+	sshClient, err := dialSSH(addr, timeout, opt.IOTimeout, cfg)
 	if err != nil {
 		msg := err.Error()
 		if strings.Contains(msg, "no common algorithm") && opt.Cipher != "" && strings.ToLower(opt.Cipher) != "auto" {
@@ -168,7 +168,7 @@ var hostKeyPreference = []string{
 	ssh.KeyAlgoRSASHA256,
 }
 
-func dialSSH(addr string, timeout time.Duration, cfg *ssh.ClientConfig) (*ssh.Client, error) {
+func dialSSH(addr string, timeout, ioTimeout time.Duration, cfg *ssh.ClientConfig) (*ssh.Client, error) {
 	attempts := make([][]string, 0, len(hostKeyPreference)+1)
 	attempts = append(attempts, nil) // default negotiation first
 	for _, algo := range hostKeyPreference {
@@ -177,10 +177,13 @@ func dialSSH(addr string, timeout time.Duration, cfg *ssh.ClientConfig) (*ssh.Cl
 
 	var firstErr error
 	for _, algos := range attempts {
-		conn, err := net.DialTimeout("tcp", addr, timeout)
+		rawConn, err := net.DialTimeout("tcp", addr, timeout)
 		if err != nil {
 			return nil, fmt.Errorf("连接 SFTP 服务器 %s 失败: %w", addr, err)
 		}
+		// Apply the handshake timeout while authenticating, then switch to the
+		// longer idle limit for transfers.
+		conn := storage.NewIdleTimeoutConn(rawConn, timeout)
 		// Bound the handshake and authentication; uploads must not inherit
 		// this deadline once the session is established.
 		_ = conn.SetDeadline(time.Now().Add(timeout))
@@ -188,6 +191,7 @@ func dialSSH(addr string, timeout time.Duration, cfg *ssh.ClientConfig) (*ssh.Cl
 		cc, chans, reqs, err := ssh.NewClientConn(conn, addr, cfg)
 		if err == nil {
 			_ = conn.SetDeadline(time.Time{})
+			conn.SetIdleTimeout(ioTimeout)
 			return ssh.NewClient(cc, chans, reqs), nil
 		}
 		_ = conn.Close()

@@ -78,8 +78,11 @@ The abstraction is `internal/storage/storage.go` (`Backend`, `Writer`, `SizedWri
 - Range-based parallel verification must compare the remote size with the expected size
   before hashing; otherwise extra trailing bytes would be ignored.
 - Retries must only cover transient errors (timeouts, reset/broken connections, EOF, HTTP
-  408/429/5xx). Never retry authentication, path conflicts, local file errors or cancellation.
+  408/429/5xx). Classify HTTP status codes and `smithy.APIError` codes by type as well as
+  text. Never retry authentication, path conflicts, local file errors or cancellation.
   SMB/SFTP `Reconnect` must rebuild both the transport and the protocol session.
+- `--io-timeout` must bound network reads and writes (SMB/SFTP socket deadlines and HTTP
+  transports); `0` disables it. It covers transfers, not local hashing.
 - `--concurrency > 1` disables the pipeline and requires one backend per worker. Workers must
   not share a `Writer`; they may share the bandwidth limiter, which is mutex-protected.
 - `--verify-only` must never upload, write records or delete. It always hashes both copies and

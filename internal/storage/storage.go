@@ -98,6 +98,15 @@ type CaseInsensitive interface {
 	CaseInsensitive() bool
 }
 
+// HTTPError carries an HTTP status code from a backend so the retry logic can
+// distinguish transient server failures from authentication and path errors.
+type HTTPError struct {
+	Code    int
+	Message string
+}
+
+func (e *HTTPError) Error() string { return e.Message }
+
 // Backend abstracts a remote directory tree. All paths are slash separated and
 // relative to the backend root; the empty string refers to the root itself.
 type Backend interface {
@@ -122,10 +131,14 @@ type Options struct {
 	Password string
 	Domain   string
 	Port     int
-	Timeout  time.Duration
+	// Timeout bounds connection setup and handshakes.
+	Timeout time.Duration
 	// Context cancels in-flight HTTP requests. Backends without request-level
 	// cancellation still use Timeout for connection setup.
 	Context context.Context
+	// IOTimeout aborts a read or write that makes no progress for this long.
+	// Zero disables the idle deadlines.
+	IOTimeout time.Duration
 	// CreateRoot asks the backend to create the target root when missing. It is
 	// false for dry runs so that a preview never changes the remote side.
 	CreateRoot bool

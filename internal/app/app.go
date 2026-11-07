@@ -112,6 +112,9 @@ type Options struct {
 	CleanTemp bool
 	// Timeout bounds connection setup and handshakes.
 	Timeout time.Duration
+	// IOTimeout aborts a read or write that makes no progress for this long.
+	// Zero disables the idle deadlines.
+	IOTimeout time.Duration
 	// Retries is the number of extra attempts for transient failures.
 	Retries    int
 	RetryDelay time.Duration
@@ -370,6 +373,7 @@ func Run(ctx context.Context, o Options) (Result, error) {
 		Domain:     o.SMB.Domain,
 		Port:       o.SMB.Port,
 		Timeout:    o.Timeout,
+		IOTimeout:  o.IOTimeout,
 		Context:    ctx,
 		CreateRoot: !o.DryRun && !o.VerifyOnly && !o.CleanTemp,
 		// Several files will reuse the same buffer pool; a single file is

@@ -43,6 +43,7 @@ type cliArgs struct {
 	VerifyOnly     bool     `arg:"--verify-only" help:"只校验已有远端文件，不上传、不写记录、不删除"`
 	CleanTemp      bool     `arg:"--clean-temp" help:"清理目标目录下本工具遗留的临时文件，清理后退出"`
 	TimeoutSec     int      `arg:"--timeout" default:"30" help:"连接/握手超时（秒）"`
+	IOTimeoutSec   int      `arg:"--io-timeout" default:"300" help:"读写空闲超时（秒），超过该时间没有数据传输就中止；0 表示不限制"`
 	Retries        int      `arg:"--retries" default:"3" help:"瞬时错误重试次数，0 表示不重试"`
 	RetryDelaySec  int      `arg:"--retry-delay" default:"1" help:"首次重试等待（秒），之后指数退避"`
 	LimitMB        int      `arg:"--limit" default:"0" help:"上传/校验总带宽上限（MiB/s），0 表示不限"`
@@ -251,6 +252,10 @@ func run() int {
 		logger.Errorf("--timeout 必须在 1-3600 秒之间")
 		return 2
 	}
+	if args.IOTimeoutSec < 0 || args.IOTimeoutSec > 86400 {
+		logger.Errorf("--io-timeout 必须在 0-86400 秒之间（0 表示不限制）")
+		return 2
+	}
 	if args.Retries < 0 || args.Retries > 20 {
 		logger.Errorf("--retries 必须在 0-20 之间")
 		return 2
@@ -372,6 +377,7 @@ func run() int {
 		VerifyOnly:        args.VerifyOnly,
 		CleanTemp:         args.CleanTemp,
 		Timeout:           time.Duration(args.TimeoutSec) * time.Second,
+		IOTimeout:         time.Duration(args.IOTimeoutSec) * time.Second,
 		Retries:           args.Retries,
 		RetryDelay:        time.Duration(args.RetryDelaySec) * time.Second,
 		LimitBytesPerSec:  int64(args.LimitMB) << 20,

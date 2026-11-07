@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/http"
 	"strings"
 	"syscall"
 	"time"
@@ -48,11 +49,31 @@ func isTransientError(err error) bool {
 		}
 	}
 
+	// S3/Smithy errors expose an HTTP status through the response wrapper even
+	// when their message does not contain the "http 500" marker.
+	var statusErr interface{ HTTPStatusCode() int }
+	if errors.As(err, &statusErr) && transientHTTPStatus(statusErr.HTTPStatusCode()) {
+		return true
+	}
+	var apiErr interface{ ErrorCode() string }
+	if errors.As(err, &apiErr) && transientAPIError(apiErr.ErrorCode()) {
+		return true
+	}
+	var httpErr *storage.HTTPError
+	if errors.As(err, &httpErr) && transientHTTPStatus(httpErr.Code) {
+		return true
+	}
+
 	msg := strings.ToLower(err.Error())
 	for _, marker := range []string{
 		"connection reset",
 		"connection refused",
+		"connection aborted",
+		"connection lost",
+		"connection timed out",
 		"broken pipe",
+		"network is unreachable",
+		"transport endpoint is not connected",
 		"use of closed network connection",
 		"i/o timeout",
 		"temporary failure",
@@ -68,6 +89,26 @@ func isTransientError(err error) bool {
 		if strings.Contains(msg, marker) {
 			return true
 		}
+	}
+	return false
+}
+
+func transientHTTPStatus(code int) bool {
+	switch code {
+	case http.StatusRequestTimeout, http.StatusTooManyRequests:
+		return true
+	}
+	return code >= 500 && code <= 599
+}
+
+// transientAPIError recognises the retryable S3 error codes that AWS services
+// return for throttling and internal failures.
+func transientAPIError(code string) bool {
+	switch code {
+	case "InternalError", "InternalFailure", "ServiceUnavailable", "SlowDown",
+		"Throttling", "ThrottlingException", "RequestLimitExceeded",
+		"TooManyRequestsException", "RequestTimeout", "RequestTimeoutException":
+		return true
 	}
 	return false
 }

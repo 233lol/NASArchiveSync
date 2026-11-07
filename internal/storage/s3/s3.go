@@ -117,7 +117,7 @@ func openWithHTTPClient(t storage.Target, opt storage.Options, httpClient *http.
 		))
 	}
 	if httpClient == nil {
-		httpClient = newHTTPClient(opt.S3Insecure, maxConcurrency*2)
+		httpClient = newHTTPClient(opt.S3Insecure, maxConcurrency*2, opt.IOTimeout)
 	}
 	loadOpts = append(loadOpts, awsconfig.WithHTTPClient(httpClient))
 
@@ -199,7 +199,7 @@ func normalizeEndpoint(raw string) (string, error) {
 	return u.String(), nil
 }
 
-func newHTTPClient(insecure bool, maxConns int) *http.Client {
+func newHTTPClient(insecure bool, maxConns int, ioTimeout time.Duration) *http.Client {
 	var tr *http.Transport
 	if base, ok := http.DefaultTransport.(*http.Transport); ok {
 		tr = base.Clone()
@@ -217,6 +217,7 @@ func newHTTPClient(insecure bool, maxConns int) *http.Client {
 	tr.ExpectContinueTimeout = time.Second
 	tr.WriteBufferSize = 64 << 10
 	tr.ReadBufferSize = 64 << 10
+	storage.WrapHTTPTransportIdleTimeout(tr, ioTimeout)
 	if insecure {
 		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // explicit opt-in
 	}

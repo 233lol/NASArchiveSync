@@ -103,7 +103,7 @@ func Open(t storage.Target, opt storage.Options) (storage.Backend, error) {
 	if timeout <= 0 {
 		timeout = defaultTimeout
 	}
-	client := newHTTPClient(timeout, opt.WebDAVInsecure)
+	client := newHTTPClient(timeout, opt.WebDAVInsecure, opt.IOTimeout)
 
 	baseCtx := opt.Context
 	if baseCtx == nil {
@@ -157,7 +157,7 @@ func (b *Backend) cacheAncestors() {
 	}
 }
 
-func newHTTPClient(timeout time.Duration, insecure bool) *http.Client {
+func newHTTPClient(timeout time.Duration, insecure bool, ioTimeout time.Duration) *http.Client {
 	var tr *http.Transport
 	if base, ok := http.DefaultTransport.(*http.Transport); ok {
 		tr = base.Clone()
@@ -174,6 +174,7 @@ func newHTTPClient(timeout time.Duration, insecure bool) *http.Client {
 	tr.ExpectContinueTimeout = time.Second
 	tr.WriteBufferSize = 64 << 10
 	tr.ReadBufferSize = 64 << 10
+	storage.WrapHTTPTransportIdleTimeout(tr, ioTimeout)
 	if insecure {
 		if tr.TLSClientConfig == nil {
 			tr.TLSClientConfig = &tls.Config{}
@@ -841,15 +842,19 @@ func (b *Backend) statusError(op, p string, resp *http.Response) error {
 		message = ": " + message
 	}
 	status := resp.StatusCode
+
+	var text string
 	switch status {
 	case http.StatusUnauthorized:
-		return fmt.Errorf("WebDAV 认证失败（用户 %q，HTTP 401）%s；请检查 URL 中的用户名密码或 --webdav-user/--webdav-pass", b.user, message)
+		text = fmt.Sprintf("WebDAV 认证失败（用户 %q，HTTP 401）%s；请检查 URL 中的用户名密码或 --webdav-user/--webdav-pass", b.user, message)
 	case http.StatusForbidden:
-		return fmt.Errorf("没有 WebDAV 访问权限（HTTP 403）%s: %s", message, b.LocationForPath(p))
+		text = fmt.Sprintf("没有 WebDAV 访问权限（HTTP 403）%s: %s", message, b.LocationForPath(p))
 	case http.StatusMovedPermanently, http.StatusFound, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
-		return fmt.Errorf("WebDAV 服务器返回重定向（HTTP %d）%s；请直接使用最终地址: %s", status, message, b.LocationForPath(p))
+		text = fmt.Sprintf("WebDAV 服务器返回重定向（HTTP %d）%s；请直接使用最终地址: %s", status, message, b.LocationForPath(p))
+	default:
+		text = fmt.Sprintf("WebDAV %s 失败（HTTP %d %s）%s: %s", op, status, http.StatusText(status), message, b.LocationForPath(p))
 	}
-	return fmt.Errorf("WebDAV %s 失败（HTTP %d %s）%s: %s", op, status, http.StatusText(status), message, b.LocationForPath(p))
+	return &storage.HTTPError{Code: status, Message: text}
 }
 
 func drain(resp *http.Response) error {

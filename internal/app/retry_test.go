@@ -78,3 +78,37 @@ func TestBandwidthLimiterDisabled(t *testing.T) {
 		t.Fatal("negative rate should disable the limiter")
 	}
 }
+
+type statusTestError struct{ code int }
+
+func (e statusTestError) Error() string       { return "backend request failed" }
+func (e statusTestError) HTTPStatusCode() int { return e.code }
+
+type apiTestError struct{ code string }
+
+func (e apiTestError) Error() string     { return "backend api error" }
+func (e apiTestError) ErrorCode() string { return e.code }
+
+func TestIsTransientErrorClassifiesStatusCodes(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"smithy 503", statusTestError{503}, true},
+		{"smithy 429", statusTestError{429}, true},
+		{"smithy 403", statusTestError{403}, false},
+		{"webdav 500", &storage.HTTPError{Code: 500}, true},
+		{"webdav 404", &storage.HTTPError{Code: 404}, false},
+		{"api slowdown", apiTestError{"SlowDown"}, true},
+		{"api missing key", apiTestError{"NoSuchKey"}, false},
+		{"sftp connection lost", errors.New("ssh: connection lost"), true},
+		{"auth failure", errors.New("authentication failed"), false},
+		{"canceled", context.Canceled, false},
+	}
+	for _, tc := range tests {
+		if got := isTransientError(tc.err); got != tc.want {
+			t.Errorf("%s: isTransientError = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
