@@ -72,6 +72,8 @@ The abstraction is `internal/storage/storage.go` (`Backend`, `Writer`, `SizedWri
 - Uploads are atomic: a unique `.nassync.<pid>.<rand>.tmp` → rename; records use a unique
   temp name too. Backends whose rename cannot replace an existing file (`RenameReplacer`
   false: SMB, Windows local) back up the old file first and restore it if the rename fails.
+  On `--force` overwrites that backup is kept until the new copy passes verification, then
+  discarded; a verification failure restores the previous file and its note.
   Clean remote temp/sidecar artifacts on failure, never the local source.
 - Range-based parallel verification must compare the remote size with the expected size
   before hashing; otherwise extra trailing bytes would be ignored.

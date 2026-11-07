@@ -653,17 +653,17 @@ func runPipeline(ctx context.Context, o Options, log *xlog.Logger, uploadBackend
 				continue
 			}
 
-			sha, uploadDur, err := uploadOnly(ctx, o, runLog, uploadBackend, st, fc, uploadFactory)
+			up, err := uploadOnly(ctx, o, runLog, uploadBackend, st, fc, uploadFactory)
 			if err != nil {
-				results <- fileResult{outcome: OutcomeFailed, file: file.Rel, size: st.size, err: err, uploadTime: uploadDur}
+				results <- fileResult{outcome: OutcomeFailed, file: file.Rel, size: st.size, err: err, uploadTime: up.duration}
 				continue
 			}
 
-			task := &uploadedTask{state: st, localSHA: sha, uploadDuration: uploadDur, index: i}
+			task := &uploadedTask{state: st, upload: up, index: i}
 			select {
 			case verifyCh <- task:
 			case <-ctx.Done():
-				cleanupRemote(uploadBackend, st.paths.remoteRel, st.paths.sidecarRel)
+				rollbackUpload(uploadBackend, st.paths.remoteRel, st.paths.sidecarRel, up.outcome, runLog)
 				return
 			}
 		}
@@ -674,7 +674,7 @@ func runPipeline(ctx context.Context, o Options, log *xlog.Logger, uploadBackend
 		defer verifierWG.Done()
 		for task := range verifyCh {
 			fc := fileContext{index: task.index, total: len(files), pipeline: true}
-			results <- verifyUploaded(ctx, o, runLog, verifyBackend, task.state, task.localSHA, task.uploadDuration, fc, verifyFactory, quiet)
+			results <- verifyUploaded(ctx, o, runLog, verifyBackend, task.state, task.upload, fc, verifyFactory, quiet)
 		}
 	}()
 
@@ -752,11 +752,16 @@ type fileResult struct {
 	verifyTime time.Duration
 }
 
+type uploadResult struct {
+	sha      string
+	outcome  replaceOutcome
+	duration time.Duration
+}
+
 type uploadedTask struct {
-	state          *fileState
-	localSHA       string
-	uploadDuration time.Duration
-	index          int
+	state  *fileState
+	upload uploadResult
+	index  int
 }
 
 type fileContext struct {
@@ -945,9 +950,12 @@ func uploadAndRecordNoVerify(ctx context.Context, o Options, log *xlog.Logger, b
 	log.Debugf("上传 %s -> %s（已关闭校验）", st.file.Path, st.paths.remotePath)
 	counter := newUpload(fc.label("上传", st.file.Rel), st.size)
 	uploadStarted := time.Now()
-	_, err := retryValue(ctx, o, log, backend, "上传", func() (struct{}, error) {
-		_, err := uploadFile(ctx, backend, st.file.Path, st.paths.remoteRel, st.size, o.Force, counter, false, o.limiter, !st.remoteExists)
-		return struct{}{}, err
+	up, err := retryValue(ctx, o, log, backend, "上传", func() (uploadResult, error) {
+		_, outcome, err := uploadFile(ctx, backend, st.file.Path, st.paths.remoteRel, st.size, o.Force, counter, false, o.limiter, !st.remoteExists)
+		if err != nil {
+			return uploadResult{}, err
+		}
+		return uploadResult{outcome: outcome}, nil
 	})
 	res.uploadTime = time.Since(uploadStarted)
 	if err != nil {
@@ -961,13 +969,13 @@ func uploadAndRecordNoVerify(ctx context.Context, o Options, log *xlog.Logger, b
 
 	after, statErr := os.Stat(st.file.Path)
 	if statErr != nil {
-		cleanupRemote(backend, st.paths.remoteRel, st.paths.sidecarRel)
+		rollbackUpload(backend, st.paths.remoteRel, st.paths.sidecarRel, up.outcome, log)
 		res.outcome = OutcomeFailed
 		res.err = fmt.Errorf("上传后检查源文件失败: %w", statErr)
 		return res
 	}
 	if after.Size() != st.size || !after.ModTime().Equal(st.info.ModTime()) {
-		cleanupRemote(backend, st.paths.remoteRel, st.paths.sidecarRel)
+		rollbackUpload(backend, st.paths.remoteRel, st.paths.sidecarRel, up.outcome, log)
 		res.outcome = OutcomeFailed
 		res.err = fmt.Errorf("源文件在上传过程中发生变化，已保留本地文件: %s", st.file.Path)
 		return res
@@ -986,10 +994,14 @@ func uploadAndRecordNoVerify(ctx context.Context, o Options, log *xlog.Logger, b
 	}
 	content := []byte(record.Render())
 	if err := ensureRecords(ctx, o, log, backend, st.paths.sidecarRel, st.paths.localNote, content, false, false); err != nil {
+		// The archive itself is complete, so keep it and drop the old backup; a
+		// later run can repair the missing note from the remote file.
+		up.outcome.commit(backend)
 		res.outcome = OutcomeFailed
 		res.err = fmt.Errorf("远端文件已上传，但保存上传记录失败，已保留本地源文件: %w", err)
 		return res
 	}
+	up.outcome.commit(backend)
 
 	log.Successf("上传完成（已关闭校验，未读回远端）: %s", st.paths.remotePath)
 	deleteLocalFile(o, log, st.file.Path, st.size, st.info.ModTime())
@@ -1125,35 +1137,39 @@ func handleSkip(ctx context.Context, o Options, log *xlog.Logger, backend storag
 }
 
 func uploadAndVerify(ctx context.Context, o Options, log *xlog.Logger, backend storage.Backend, st *fileState, fc fileContext, newHash, newUpload counterFactory, quiet bool) fileResult {
-	localSHA, uploadDur, err := uploadOnly(ctx, o, log, backend, st, fc, newUpload)
+	up, err := uploadOnly(ctx, o, log, backend, st, fc, newUpload)
 	if err != nil {
-		return fileResult{outcome: OutcomeFailed, file: st.file.Rel, size: st.size, err: err, uploadTime: uploadDur}
+		return fileResult{outcome: OutcomeFailed, file: st.file.Rel, size: st.size, err: err, uploadTime: up.duration}
 	}
-	return verifyUploaded(ctx, o, log, backend, st, localSHA, uploadDur, fc, newHash, quiet)
+	return verifyUploaded(ctx, o, log, backend, st, up, fc, newHash, quiet)
 }
 
-func uploadOnly(ctx context.Context, o Options, log *xlog.Logger, backend storage.Backend, st *fileState, fc fileContext, newUpload counterFactory) (string, time.Duration, error) {
+func uploadOnly(ctx context.Context, o Options, log *xlog.Logger, backend storage.Backend, st *fileState, fc fileContext, newUpload counterFactory) (uploadResult, error) {
 	if st.paths.relDir != "" {
 		if err := retryDo(ctx, o, log, backend, "创建远端目录", func() error {
 			return backend.MkdirAll(st.paths.relDir)
 		}); err != nil {
-			return "", 0, fmt.Errorf("创建远端目录失败: %w", err)
+			return uploadResult{}, fmt.Errorf("创建远端目录失败: %w", err)
 		}
 	}
 
 	log.Debugf("上传 %s -> %s", st.file.Path, st.paths.remotePath)
 	counter := newUpload(fc.label("上传", st.file.Rel), st.size)
 	uploadStarted := time.Now()
-	localSHA, err := retryValue(ctx, o, log, backend, "上传", func() (string, error) {
-		return uploadFile(ctx, backend, st.file.Path, st.paths.remoteRel, st.size, o.Force, counter, true, o.limiter, !st.remoteExists)
+	up, err := retryValue(ctx, o, log, backend, "上传", func() (uploadResult, error) {
+		sha, outcome, err := uploadFile(ctx, backend, st.file.Path, st.paths.remoteRel, st.size, o.Force, counter, true, o.limiter, !st.remoteExists)
+		if err != nil {
+			return uploadResult{}, err
+		}
+		return uploadResult{sha: sha, outcome: outcome}, nil
 	})
-	uploadDuration := time.Since(uploadStarted)
+	up.duration = time.Since(uploadStarted)
 	if err != nil {
 		counter.Abort()
 		// The previous remote copy (if any) and its record are still valid: only
 		// clean up temporary files here.
 		cleanupTempFiles(backend, st.paths.remoteRel, st.paths.sidecarRel)
-		return "", uploadDuration, err
+		return up, err
 	}
 	counter.Finish()
 
@@ -1161,19 +1177,19 @@ func uploadOnly(ctx context.Context, o Options, log *xlog.Logger, backend storag
 	// change underneath us, otherwise the uploaded bytes may be a mix.
 	after, statErr := os.Stat(st.file.Path)
 	if statErr != nil {
-		cleanupRemote(backend, st.paths.remoteRel, st.paths.sidecarRel)
-		return "", uploadDuration, fmt.Errorf("上传后检查源文件失败: %w", statErr)
+		rollbackUpload(backend, st.paths.remoteRel, st.paths.sidecarRel, up.outcome, log)
+		return up, fmt.Errorf("上传后检查源文件失败: %w", statErr)
 	}
 	if after.Size() != st.size || !after.ModTime().Equal(st.info.ModTime()) {
-		cleanupRemote(backend, st.paths.remoteRel, st.paths.sidecarRel)
-		return "", uploadDuration, fmt.Errorf("源文件在上传过程中发生变化，已保留本地文件: %s", st.file.Path)
+		rollbackUpload(backend, st.paths.remoteRel, st.paths.sidecarRel, up.outcome, log)
+		return up, fmt.Errorf("源文件在上传过程中发生变化，已保留本地文件: %s", st.file.Path)
 	}
-	log.Debugf("上传耗时: %s", humanize.Duration(uploadDuration))
-	return localSHA, uploadDuration, nil
+	log.Debugf("上传耗时: %s", humanize.Duration(up.duration))
+	return up, nil
 }
 
-func verifyUploaded(ctx context.Context, o Options, log *xlog.Logger, backend storage.Backend, st *fileState, localSHA string, uploadDur time.Duration, fc fileContext, newHash counterFactory, quiet bool) fileResult {
-	res := fileResult{file: st.file.Rel, size: st.size, uploadTime: uploadDur}
+func verifyUploaded(ctx context.Context, o Options, log *xlog.Logger, backend storage.Backend, st *fileState, up uploadResult, fc fileContext, newHash counterFactory, quiet bool) fileResult {
+	res := fileResult{file: st.file.Rel, size: st.size, uploadTime: up.duration}
 
 	counter := newHash(fc.label("校验远端", st.file.Rel), st.size)
 	verifyStart := time.Now()
@@ -1183,31 +1199,34 @@ func verifyUploaded(ctx context.Context, o Options, log *xlog.Logger, backend st
 	res.verifyTime = time.Since(verifyStart)
 	if err != nil {
 		counter.Abort()
-		cleanupRemote(backend, st.paths.remoteRel, st.paths.sidecarRel)
+		rollbackUpload(backend, st.paths.remoteRel, st.paths.sidecarRel, up.outcome, log)
 		res.outcome = OutcomeFailed
 		res.err = fmt.Errorf("读取远端文件校验失败: %w", err)
 		return res
 	}
 	counter.Finish()
 
-	if remoteSHA != localSHA {
-		cleanupRemote(backend, st.paths.remoteRel, st.paths.sidecarRel)
+	if remoteSHA != up.sha {
+		rollbackUpload(backend, st.paths.remoteRel, st.paths.sidecarRel, up.outcome, log)
 		res.outcome = OutcomeFailed
-		res.err = fmt.Errorf("SHA256 不一致（本地 %s，远端 %s），已删除远端文件并保留本地文件",
-			shortHash(localSHA), shortHash(remoteSHA))
+		res.err = fmt.Errorf("SHA256 不一致（本地 %s，远端 %s），已清理本次上传的远端文件并保留本地文件",
+			shortHash(up.sha), shortHash(remoteSHA))
 		return res
 	}
+	// The new copy is verified: the previous remote version is no longer
+	// needed, even if writing the completion note below fails.
+	up.outcome.commit(backend)
 	log.Debugf("远端 SHA256: %s", remoteSHA)
 
 	record := report.Record{
 		FileName:      filepath.Base(st.file.Path),
 		TargetPath:    st.paths.remotePath,
 		Size:          st.size,
-		SHA256:        localSHA,
+		SHA256:        up.sha,
 		UploadedAt:    now(o),
 		SourcePath:    st.file.Path,
 		SourceModTime: st.info.ModTime(),
-		Duration:      uploadDur,
+		Duration:      up.duration,
 		ToolVersion:   version(o),
 		Verified:      true,
 	}
@@ -1352,12 +1371,68 @@ func backendReplacesOnRename(backend storage.Backend) bool {
 	return ok && r.RenameReplaces()
 }
 
-// renameReplacing moves tmpRel to rel. Backends whose Rename cannot replace an
-// existing file first move the old file to a backup, so a failed rename keeps
-// the previous remote copy instead of losing it.
+// replaceOutcome describes a rename that had to move the previous destination
+// aside because the backend cannot atomically replace it. The caller decides
+// when the old copy may be discarded (commit) or must be restored (rollback).
+type replaceOutcome struct {
+	backupRel string
+}
+
+// commit drops the backup of the previous remote file.
+func (r replaceOutcome) commit(backend storage.Backend) {
+	if r.backupRel == "" {
+		return
+	}
+	_ = backend.Remove(r.backupRel)
+}
+
+// rollback removes the newly written file and restores the previous one.
+func (r replaceOutcome) rollback(backend storage.Backend, newRel string) error {
+	if r.backupRel == "" {
+		return nil
+	}
+	if err := backend.Remove(newRel); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("删除新远端文件失败（旧文件保留在 %s）: %w", r.backupRel, err)
+	}
+	if err := backend.Rename(r.backupRel, newRel); err != nil {
+		return fmt.Errorf("恢复旧远端文件失败（旧文件保留在 %s）: %w", r.backupRel, err)
+	}
+	return nil
+}
+
+// rollbackUpload undoes a failed upload. When the previous remote copy was
+// moved aside it is restored, which also keeps its old completion note valid;
+// otherwise the new copy and its note are removed as before.
+func rollbackUpload(backend storage.Backend, remoteRel, sidecarRel string, outcome replaceOutcome, log *xlog.Logger) {
+	if outcome.backupRel == "" {
+		cleanupRemote(backend, remoteRel, sidecarRel)
+		return
+	}
+	if err := outcome.rollback(backend, remoteRel); err != nil {
+		log.Warnf("%v", err)
+	}
+}
+
+// renameReplacing moves tmpRel to rel and immediately discards any backup. It is
+// used for small completion notes, where the previous note is expendable.
 func renameReplacing(backend storage.Backend, tmpRel, rel string) error {
+	outcome, err := renameReplacingKeepBackup(backend, tmpRel, rel)
+	if err != nil {
+		return err
+	}
+	outcome.commit(backend)
+	return nil
+}
+
+// renameReplacingKeepBackup is like renameReplacing but leaves the previous
+// destination at the returned backup path when the backend cannot replace it.
+// The caller must call commit or rollback on the result.
+func renameReplacingKeepBackup(backend storage.Backend, tmpRel, rel string) (replaceOutcome, error) {
 	if backendReplacesOnRename(backend) {
-		return backend.Rename(tmpRel, rel)
+		if err := backend.Rename(tmpRel, rel); err != nil {
+			return replaceOutcome{}, err
+		}
+		return replaceOutcome{}, nil
 	}
 
 	backupRel := tmpRel + ".bak"
@@ -1365,31 +1440,31 @@ func renameReplacing(backend storage.Backend, tmpRel, rel string) error {
 	backedUp := false
 	if _, err := backend.Stat(rel); err == nil {
 		if err := backend.Rename(rel, backupRel); err != nil {
-			return fmt.Errorf("备份旧远端文件失败: %w", err)
+			return replaceOutcome{}, fmt.Errorf("备份旧远端文件失败: %w", err)
 		}
 		backedUp = true
 	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("检查旧远端文件失败: %w", err)
+		return replaceOutcome{}, fmt.Errorf("检查旧远端文件失败: %w", err)
 	}
 
 	if err := backend.Rename(tmpRel, rel); err != nil {
 		if backedUp {
 			if restoreErr := backend.Rename(backupRel, rel); restoreErr != nil {
-				return fmt.Errorf("重命名失败且恢复旧文件失败（旧文件保留在 %s）: %w", backupRel, err)
+				return replaceOutcome{}, fmt.Errorf("重命名失败且恢复旧文件失败（旧文件保留在 %s）: %w", backupRel, err)
 			}
 		}
-		return err
+		return replaceOutcome{}, err
 	}
 	if backedUp {
-		_ = backend.Remove(backupRel)
+		return replaceOutcome{backupRel: backupRel}, nil
 	}
-	return nil
+	return replaceOutcome{}, nil
 }
 
-func uploadFile(ctx context.Context, backend storage.Backend, localPath, remoteRel string, size int64, overwrite bool, sink progress.Sink, computeHash bool, limiter *bandwidthLimiter, direct bool) (string, error) {
+func uploadFile(ctx context.Context, backend storage.Backend, localPath, remoteRel string, size int64, overwrite bool, sink progress.Sink, computeHash bool, limiter *bandwidthLimiter, direct bool) (string, replaceOutcome, error) {
 	src, err := os.Open(localPath)
 	if err != nil {
-		return "", fmt.Errorf("打开源文件失败: %w", err)
+		return "", replaceOutcome{}, fmt.Errorf("打开源文件失败: %w", err)
 	}
 	defer src.Close()
 
@@ -1400,7 +1475,7 @@ func uploadFile(ctx context.Context, backend storage.Backend, localPath, remoteR
 		if creator, ok := backend.(storage.AtomicCreator); ok {
 			dst, err = creator.CreateAtomic(remoteRel)
 			if err != nil {
-				return "", fmt.Errorf("创建远端文件失败: %w", err)
+				return "", replaceOutcome{}, fmt.Errorf("创建远端文件失败: %w", err)
 			}
 			directWrite = true
 		}
@@ -1410,7 +1485,7 @@ func uploadFile(ctx context.Context, backend storage.Backend, localPath, remoteR
 		_ = backend.Remove(tmpRel)
 		dst, err = backend.Create(tmpRel)
 		if err != nil {
-			return "", fmt.Errorf("创建远端临时文件失败: %w", err)
+			return "", replaceOutcome{}, fmt.Errorf("创建远端临时文件失败: %w", err)
 		}
 	}
 	if sized, ok := dst.(storage.SizedWriter); ok {
@@ -1443,28 +1518,29 @@ func uploadFile(ctx context.Context, backend storage.Backend, localPath, remoteR
 		if !directWrite {
 			_ = backend.Remove(tmpRel)
 		}
-		return "", fmt.Errorf("上传失败: %w", copyErr)
+		return "", replaceOutcome{}, fmt.Errorf("上传失败: %w", copyErr)
 	}
 
 	if directWrite {
 		if !computeHash {
-			return "", nil
+			return "", replaceOutcome{}, nil
 		}
-		return hex.EncodeToString(h.Sum(nil)), nil
+		return hex.EncodeToString(h.Sum(nil)), replaceOutcome{}, nil
 	}
+	var outcome replaceOutcome
 	if overwrite {
-		if err := renameReplacing(backend, tmpRel, remoteRel); err != nil {
-			_ = backend.Remove(tmpRel)
-			return "", fmt.Errorf("重命名远端临时文件失败: %w", err)
-		}
-	} else if err := backend.Rename(tmpRel, remoteRel); err != nil {
+		outcome, err = renameReplacingKeepBackup(backend, tmpRel, remoteRel)
+	} else {
+		err = backend.Rename(tmpRel, remoteRel)
+	}
+	if err != nil {
 		_ = backend.Remove(tmpRel)
-		return "", fmt.Errorf("重命名远端临时文件失败: %w", err)
+		return "", replaceOutcome{}, fmt.Errorf("重命名远端临时文件失败: %w", err)
 	}
 	if !computeHash {
-		return "", nil
+		return "", outcome, nil
 	}
-	return hex.EncodeToString(h.Sum(nil)), nil
+	return hex.EncodeToString(h.Sum(nil)), outcome, nil
 }
 
 func bufferSizeFor(size int64) int {
