@@ -93,6 +93,10 @@ The abstraction is `internal/storage/storage.go` (`Backend`, `Writer`, `SizedWri
   SHA256 required unless `校验方式: none`. Renaming keys/messages breaks skip detection.
 - An existing remote file with no usable matching record is a conflict; only `--force`
   overwrites. Verification mismatch also deletes the remote copy and keeps the source.
+- Case-insensitive targets (SMB, Windows local/native) must reject source trees whose
+  remote paths collide after case folding; `--force` must never silently merge them.
+  Source and target paths are compared after resolving symlinks and junctions, including
+  for target directories that do not exist yet.
 - Logs go to **stderr**; progress and `--list` go to **stdout**. `--list` prints only
   relative paths, needs no target and must not open a backend.
 - User-facing messages/help/README are Chinese; code comments are English. Preserve that.

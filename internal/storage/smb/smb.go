@@ -108,6 +108,10 @@ func (b *Backend) Kind() string { return "smb" }
 // (ReplaceIfExists is not set by the client library).
 func (b *Backend) RenameReplaces() bool { return false }
 
+// CaseInsensitive reports that SMB shares are normally matched without regard
+// to case.
+func (b *Backend) CaseInsensitive() bool { return true }
+
 func (b *Backend) Root() string {
 	p := `\\` + b.host + `\` + b.shareTo
 	if b.root != "" {

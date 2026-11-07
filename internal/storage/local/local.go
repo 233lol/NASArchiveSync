@@ -37,6 +37,10 @@ func (b *Backend) Kind() string { return "local" }
 // Unix does; Windows returns an error instead.
 func (b *Backend) RenameReplaces() bool { return runtime.GOOS != "windows" }
 
+// CaseInsensitive reports that Windows paths are matched without regard to
+// case.
+func (b *Backend) CaseInsensitive() bool { return runtime.GOOS == "windows" }
+
 func (b *Backend) Root() string { return b.root }
 
 func (b *Backend) Location(rel string) string {

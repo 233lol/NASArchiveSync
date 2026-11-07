@@ -44,6 +44,10 @@ func (b *Backend) Kind() string { return "smb-native" }
 // rename does not replace an existing file.
 func (b *Backend) RenameReplaces() bool { return runtime.GOOS != "windows" }
 
+// CaseInsensitive follows the local backend semantics. The system SMB
+// redirector on Windows is case-insensitive.
+func (b *Backend) CaseInsensitive() bool { return runtime.GOOS == "windows" }
+
 // OpenRange delegates to the underlying local backend.
 func (b *Backend) OpenRange(rel string, offset, length int64) (io.ReadCloser, error) {
 	rr, ok := b.Backend.(storage.RangeReader)

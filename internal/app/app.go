@@ -436,6 +436,14 @@ func Run(ctx context.Context, o Options) (Result, error) {
 		log.Warnf("已关闭校验: 不计算 SHA256，上传后不读回远端文件，上传记录将标记为未校验")
 	}
 
+	// A case-insensitive target cannot hold both a.7z and A.7z. Detect this
+	// before uploading so --force cannot silently replace one with the other.
+	if !o.CleanTemp && !o.VerifyOnly && caseInsensitiveTarget(uploadBackend) {
+		if groups := pathCollisionGroups(files, o.sourcePrefix); len(groups) > 0 {
+			return res, pathCollisionError(groups)
+		}
+	}
+
 	if o.CleanTemp {
 		removed, cleanupErr := cleanRemoteTemps(ctx, o, log, uploadBackend)
 		res.RemovedTmp = removed
@@ -1847,7 +1855,7 @@ func useNativeSMB(target storage.Target, o Options) (bool, error) {
 }
 
 func isWithin(child, parent string) bool {
-	rel, err := filepath.Rel(parent, child)
+	rel, err := filepath.Rel(resolvedPath(parent), resolvedPath(child))
 	if err != nil {
 		return false
 	}
@@ -1855,12 +1863,57 @@ func isWithin(child, parent string) bool {
 }
 
 func samePath(a, b string) bool {
-	a = filepath.Clean(a)
-	b = filepath.Clean(b)
+	a = resolvedPath(a)
+	b = resolvedPath(b)
 	if a == b {
 		return true
 	}
 	return runtime.GOOS == "windows" && strings.EqualFold(a, b)
+}
+
+// resolvedPath follows symbolic links and junctions component by component.
+// Unlike filepath.EvalSymlinks it also resolves paths that do not exist yet
+// (the missing components are simply appended) and it understands Windows
+// junctions, which EvalSymlinks leaves untouched.
+func resolvedPath(p string) string {
+	p = filepath.Clean(p)
+	vol := filepath.VolumeName(p)
+	rest := strings.TrimPrefix(p, vol)
+	rest = strings.TrimLeft(rest, `/\`)
+	if rest == "" {
+		if vol != "" {
+			return filepath.Clean(vol + string(filepath.Separator))
+		}
+		return p
+	}
+
+	current := vol
+	if current == "" {
+		if filepath.IsAbs(p) {
+			current = string(filepath.Separator)
+		}
+	} else if !strings.HasSuffix(current, string(filepath.Separator)) {
+		current += string(filepath.Separator)
+	}
+
+	links := 0
+	for _, segment := range strings.Split(rest, string(filepath.Separator)) {
+		next := filepath.Join(current, segment)
+		target, err := os.Readlink(next)
+		if err != nil {
+			current = next
+			continue
+		}
+		links++
+		if links > 64 {
+			return p
+		}
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(filepath.Dir(next), target)
+		}
+		current = target
+	}
+	return filepath.Clean(current)
 }
 
 type ctxReader struct {

@@ -90,6 +90,14 @@ type Lister interface {
 	List(rel string) ([]FileInfo, error)
 }
 
+// CaseInsensitive is implemented by backends whose remote file system treats
+// paths case-insensitively. The uploader rejects source trees whose files would
+// collapse onto the same remote path, which could otherwise lose data when an
+// overwrite is forced.
+type CaseInsensitive interface {
+	CaseInsensitive() bool
+}
+
 // Backend abstracts a remote directory tree. All paths are slash separated and
 // relative to the backend root; the empty string refers to the root itself.
 type Backend interface {
