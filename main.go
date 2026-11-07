@@ -208,8 +208,8 @@ func run() int {
 		logger.Errorf("--sftp-cipher 不支持 %q（可选: auto、%s）", args.SFTPCipher, strings.Join(sftp.SupportedCiphers, "、"))
 		return 2
 	}
-	if args.NoVerify && args.Recheck {
-		logger.Errorf("--recheck 需要读取远端并计算 SHA256，不能与 --no-verify 同时使用")
+	if err := app.ValidateFlags(args.List, args.VerifyOnly, args.CleanTemp, args.DryRun, args.NoVerify, args.Recheck); err != nil {
+		logger.Errorf("%v", err)
 		return 2
 	}
 
@@ -266,22 +266,6 @@ func run() int {
 	}
 	if args.LimitMB < 0 {
 		logger.Errorf("--limit 不能为负数")
-		return 2
-	}
-	if args.VerifyOnly && args.NoVerify {
-		logger.Errorf("--verify-only 需要读取并计算 SHA256，不能与 --no-verify 同时使用")
-		return 2
-	}
-	if args.VerifyOnly && args.DryRun {
-		logger.Errorf("--verify-only 本身就是只读检查，不能与 --dry-run 同时使用")
-		return 2
-	}
-	if args.CleanTemp && args.DryRun {
-		logger.Errorf("--clean-temp 会删除文件，不能与 --dry-run 同时使用")
-		return 2
-	}
-	if args.List && (args.CleanTemp || args.VerifyOnly) {
-		logger.Errorf("--list 只列出文件，不能与 --clean-temp 或 --verify-only 同时使用")
 		return 2
 	}
 
